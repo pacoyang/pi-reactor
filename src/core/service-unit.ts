@@ -12,7 +12,6 @@
  * version manager, where nothing is where a template would guess.
  */
 import { homedir } from "node:os";
-import { fileURLToPath } from "node:url";
 import type { Paths } from "./paths.ts";
 
 export type ServiceKind = "systemd" | "launchd";
@@ -44,18 +43,22 @@ export function defaultServiceKind(platform: string = process.platform): Service
  * "the job cannot find git", so the honest default is the PATH you are standing
  * in right now.
  */
-export function serviceUnitInput(paths: Paths, env: NodeJS.ProcessEnv = process.env): ServiceUnitInput {
+export function serviceUnitInput(
+	paths: Paths,
+	env: NodeJS.ProcessEnv = process.env,
+	argv: string[] = process.argv,
+): ServiceUnitInput {
 	return {
 		paths,
 		execPath: process.execPath,
-		// The daemon is started as `node /path/to/cli serve` rather than through the
-		// `pi-reactor` shim on PATH: an init system has no PATH worth relying on,
-		// and this needs no lookup at all.
-		//
-		// Either extension: a checkout runs the .ts sources directly, while an
-		// installed package runs the compiled .js — Node refuses to strip types
-		// under node_modules, so the published artifact is built.
-		scriptPath: fileURLToPath(import.meta.url).replace(/core[/\\]service-unit\.(ts|js)$/, (_m, ext: string) => `cli.${ext}`),
+		// The program to start is the one generating this file, which Node has
+		// already resolved into argv[1] — absolute, and with the npm bin symlink
+		// followed. No path arithmetic: deriving a sibling module's location by
+		// rewriting this file's own name encodes the layout into a string pattern,
+		// and every build or move breaks it silently. That is not hypothetical —
+		// compiling to dist/ did exactly that, and the unit pointed at the wrong
+		// file until it was caught.
+		scriptPath: argv[1] ?? "",
 		path: env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
 		home: homedir(),
 		...(env.PI_REACTOR_DIR ? { reactorDir: paths.root } : {}),

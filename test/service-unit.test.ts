@@ -90,8 +90,16 @@ test("the platform picks the format, and the install hint goes with it", () => {
 test("serviceUnitInput reads the live process rather than being told", () => {
 	const live = serviceUnitInput(paths, { PATH: "/live/path" });
 	assert.equal(live.execPath, process.execPath);
-	assert.match(live.scriptPath, /cli\.ts$/, "the daemon is started by script path, needing no PATH lookup");
 	assert.equal(live.path, "/live/path");
+
+	// The program to start is whichever one is generating the file. Taking it from
+	// argv[1] rather than deriving it from this module's own filename is what makes
+	// the unit survive a build: compiling to dist/ silently broke the derivation,
+	// and the generated unit pointed at the wrong file.
+	assert.equal(serviceUnitInput(paths, {}, ["node", "/opt/pi-reactor/dist/cli.js"]).scriptPath,
+		"/opt/pi-reactor/dist/cli.js");
+	assert.equal(serviceUnitInput(paths, {}, ["node", "/checkout/src/cli.ts"]).scriptPath,
+		"/checkout/src/cli.ts", "a checkout runs the sources directly, and that is what it should start");
 	assert.equal(live.reactorDir, undefined, "no PI_REACTOR_DIR in that env means the default is in use");
 	assert.equal(serviceUnitInput(paths, { PI_REACTOR_DIR: "/srv/r" }).reactorDir, paths.root);
 });
