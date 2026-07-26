@@ -48,10 +48,14 @@ export function serviceUnitInput(paths: Paths, env: NodeJS.ProcessEnv = process.
 	return {
 		paths,
 		execPath: process.execPath,
-		// The daemon is started as `node /path/to/cli.ts serve` rather than through
-		// the `pi-reactor` shim on PATH: an init system has no PATH worth relying
-		// on, and this needs no lookup at all.
-		scriptPath: fileURLToPath(import.meta.url).replace(/core[/\\]service-unit\.ts$/, "cli.ts"),
+		// The daemon is started as `node /path/to/cli serve` rather than through the
+		// `pi-reactor` shim on PATH: an init system has no PATH worth relying on,
+		// and this needs no lookup at all.
+		//
+		// Either extension: a checkout runs the .ts sources directly, while an
+		// installed package runs the compiled .js — Node refuses to strip types
+		// under node_modules, so the published artifact is built.
+		scriptPath: fileURLToPath(import.meta.url).replace(/core[/\\]service-unit\.(ts|js)$/, (_m, ext: string) => `cli.${ext}`),
 		path: env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
 		home: homedir(),
 		...(env.PI_REACTOR_DIR ? { reactorDir: paths.root } : {}),

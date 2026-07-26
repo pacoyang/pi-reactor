@@ -1,0 +1,22 @@
+// Emits the published artifact.
+//
+// Development needs no build: Node strips types from the source directly. But
+// Node refuses to do that for files under node_modules
+// (ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING), and no flag overrides it — so
+// an installed package must ship JavaScript or its CLI cannot start at all.
+//
+// `rewriteRelativeImportExtensions` is what makes both worlds work from one
+// source: imports are written as `./paths.ts` so Node can run them in place,
+// and rewritten to `./paths.js` on the way out.
+{
+	"extends": "./tsconfig.json",
+	"compilerOptions": {
+		"noEmit": false,
+		"outDir": "dist",
+		"rootDir": "src",
+		"rewriteRelativeImportExtensions": true,
+		"declaration": false,
+		"sourceMap": true
+	},
+	"include": ["src/**/*.ts"]
+}

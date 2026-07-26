@@ -22,25 +22,27 @@
     "node": ">=22.19.0"
   },
   "bin": {
-    "pi-reactor": "./src/cli.ts"
+    "pi-reactor": "./dist/cli.js"
   },
   "pi": {
     "extensions": [
-      "./src/extension/index.ts"
+      "./dist/extension/index.js"
     ],
     "skills": [
       "./skills/operate-pi-reactor/SKILL.md"
     ]
   },
   "files": [
-    "src",
+    "dist",
     "skills"
   ],
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
     "test": "node --test \"test/!(*.contract).test.ts\"",
     "test:contract": "node --test --test-timeout=120000 \"test/*.contract.test.ts\"",
     "typecheck": "tsc --noEmit",
-    "check": "npm run typecheck && npm test"
+    "check": "npm run typecheck && npm test",
+    "prepublishOnly": "npm run build && npm run check"
   },
   "dependencies": {
     "croner": "^9.1.0"

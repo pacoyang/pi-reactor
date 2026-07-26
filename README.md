@@ -28,8 +28,7 @@ npm install -g pi-reactor    # the CLI and the daemon
 pi install npm:pi-reactor    # the /reactor extension and its skill, inside your Pi
 ```
 
-Requires Node 22.19+ (native TypeScript type stripping, no build step) and a Pi install
-the daemon can spawn.
+Requires Node 22.19+ and a Pi install the daemon can spawn.
 
 ## Quick Start
 
@@ -476,9 +475,15 @@ starts, and a paused queue comes back paused.
 npm test              # unit and integration; no network, no model calls
 npm run test:contract # spawns real Pi, pinned to the verified version
 npm run check         # typecheck + test
+npm run build         # emit dist/ — only needed to publish
 ```
 
-There is no build step — Node strips the types. The contract tests are the upgrade gate:
+Development needs no build: Node strips types from the sources directly, and the tests
+run them as they are. Publishing does need one, because Node refuses to strip types under
+`node_modules` and no flag overrides it — an installed package has to ship JavaScript or
+its CLI cannot start. `rewriteRelativeImportExtensions` is what lets one source tree serve
+both: imports are written `./paths.ts` so Node runs them in place, and rewritten to
+`./paths.js` on the way out. The contract tests are the upgrade gate:
 the RPC protocol carries no semver promise, so run them before trusting a new Pi release.
 
 ## License
