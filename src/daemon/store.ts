@@ -1,0 +1,493 @@
+/**
+ * Every SQL statement the daemon issues, in one place.
+ *
+ * Keeping them together means the transaction boundaries — which are the real
+ * correctness surface here — can be read side by side instead of hunted across
+ * modules. The daemon is the sole writer, so `BEGIN IMMEDIATE` is the only
+ * concurrency control required.
+ */
+import type { Db } from "../core/db.ts";
+import { nowIso, isoSecondsAgo, withTransaction } from "../core/db.ts";
+import type { CloudEvent } from "../core/cloudevents.ts";
+import type { NotifyWhen } from "../core/config.ts";
+
+export interface EnqueueInput {
+	event: CloudEvent;
+	lane: "interactive" | "batch";
+	agent: string;
+	task?: string | undefined;
+	skill?: string | undefined;
+	triggerId?: string | undefined;
+	maxDurationS: number;
+	requireCleanTree: boolean;
+	retryable: boolean;
+	notify?: { sink: string; when: NotifyWhen } | undefined;
+	/**
+	 * Advances a schedule's watermark in the SAME transaction as the insert.
+	 *
+	 * Two separate writes would leave a crash window in which the job exists but
+	 * the watermark does not, so misfire recovery re-derives the occurrence and
+	 * enqueues it a second time. The deterministic event id normally catches that,
+	 * but only if both paths derive the same instant (see scheduler.arm).
+	 */
+	watermark?: { triggerId: string; firedAt: Date } | undefined;
+}
+
+export interface EnqueueResult {
+	seq: number;
+	jobId: number | null;
+	duplicate: boolean;
+}
+
+export interface JobRow {
+	id: number;
+	agent: string;
+	task: string | null;
+	skill: string | null;
+	trigger_id: string | null;
+	attempts: number;
+	max_duration_s: number;
+	require_clean_tree: number;
+	retryable: number;
+	notify_sink: string | null;
+	notify_when: string | null;
+	/**
+	 * The event's `data`, as stored.
+	 *
+	 * Carried on the claim rather than fetched separately because a job triggered
+	 * by a webhook is meaningless without it: "fix the issue" does not say which
+	 * issue, in which repository. A cron fire has none and this stays "{}".
+	 */
+	event_data: string;
+}
+
+/**
+ * Writes the event and its job in ONE transaction.
+ *
+ * A duplicate (source,id) is an idempotent success, not an error: cron catch-up
+ * and webhook redelivery both legitimately replay a key, and the caller must not
+ * treat that as something to retry. Returning the existing seq lets them
+ * correlate anyway.
+ */
+export function enqueue(db: Db, input: EnqueueInput): EnqueueResult {
+	return withTransaction(db, () => {
+		// One check, inside the transaction. An extra read beforehand would add a
+		// third layer to an invariant the unique index already owns, and could only
+		// ever be stale by the time the write lock is held.
+		const existing = db
+			.prepare("SELECT seq FROM events WHERE ce_source = ? AND ce_id = ?")
+			.get(input.event.source, input.event.id) as { seq: number } | undefined;
+		if (existing) {
+			// A duplicate still advances the watermark: the occurrence demonstrably
+			// landed, and leaving the watermark behind would re-derive it forever.
+			advanceWatermark(db, input.watermark);
+			return { seq: existing.seq, jobId: null, duplicate: true };
+		}
+
+		const eventInfo = db
+			.prepare(
+				`INSERT INTO events (ce_id, ce_source, ce_type, ce_time, lane, data, received_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			)
+			.run(
+				input.event.id,
+				input.event.source,
+				input.event.type,
+				input.event.time ?? null,
+				input.lane,
+				JSON.stringify(input.event.data ?? {}),
+				nowIso(),
+			);
+		const seq = Number(eventInfo.lastInsertRowid);
+
+		const jobInfo = db
+			.prepare(
+				`INSERT INTO jobs (event_seq, agent, task, skill, trigger_id, max_duration_s,
+				                   require_clean_tree, retryable, notify_sink, notify_when, created_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			)
+			.run(
+				seq,
+				input.agent,
+				input.task ?? null,
+				input.skill ?? null,
+				input.triggerId ?? null,
+				input.maxDurationS,
+				input.requireCleanTree ? 1 : 0,
+				input.retryable ? 1 : 0,
+				input.notify?.sink ?? null,
+				input.notify?.when ?? null,
+				nowIso(),
+			);
+
+		advanceWatermark(db, input.watermark);
+		return { seq, jobId: Number(jobInfo.lastInsertRowid), duplicate: false };
+	});
+}
+
+function advanceWatermark(db: Db, watermark: EnqueueInput["watermark"]): void {
+	if (!watermark) return;
+	db.prepare("UPDATE schedules SET last_fired_at = ?, updated_at = ? WHERE trigger_id = ?")
+		.run(watermark.firedAt.toISOString(), nowIso(), watermark.triggerId);
+}
+
+/**
+ * Claims the next runnable job, or null.
+ *
+ * Three conditions, expressed in the SQL rather than in JavaScript so the whole
+ * decision is atomic under `BEGIN IMMEDIATE`:
+ *   - pending and past its backoff time
+ *   - no other job for the same agent is running (same cwd, so serialise writes)
+ *   - total running below the global concurrency limit
+ */
+export function claimNextJob(db: Db, concurrency: number): JobRow | null {
+	return withTransaction(db, () => {
+		const running = db.prepare("SELECT COUNT(*) AS n FROM jobs WHERE state = 'running'").get() as { n: number };
+		if (running.n >= concurrency) return null;
+
+		const row = db
+			.prepare(
+				`SELECT j.id, j.agent, j.task, j.skill, j.trigger_id, j.attempts, j.max_duration_s,
+				        j.require_clean_tree, j.retryable, j.notify_sink, j.notify_when,
+				        e.data AS event_data
+				 FROM jobs j JOIN events e ON e.seq = j.event_seq
+				 WHERE j.state = 'pending'
+				   AND (j.scheduled_at IS NULL OR j.scheduled_at <= ?)
+				   AND j.agent NOT IN (SELECT agent FROM jobs WHERE state = 'running')
+				 ORDER BY j.created_at, j.id
+				 LIMIT 1`,
+			)
+			.get(nowIso()) as JobRow | undefined;
+
+		if (!row) return null;
+
+		db.prepare("UPDATE jobs SET state = 'running', started_at = ? WHERE id = ?").run(nowIso(), row.id);
+		return row;
+	});
+}
+
+export interface FinishInput {
+	jobId: number;
+	agent: string;
+	outcome: "succeeded" | "failed" | "interrupted";
+	reason?: string | undefined;
+	errorSummary?: string | undefined;
+	pid?: number | undefined;
+	sessionFile?: string | undefined;
+	usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number } | undefined;
+	startedAt: string;
+	/**
+	 * Present when the notify policy fires.
+	 *
+	 * The body may be a function of the run id, because a notification that wants
+	 * to say "continue this conversation with run 42" cannot know 42 until the run
+	 * row exists — and that row is inserted in this very transaction.
+	 */
+	notify?: { sink: string; body: string | ((runId: number) => string) } | undefined;
+	/** When set, the job returns to pending at this time instead of reaching a terminal state. */
+	retryAt?: string | undefined;
+}
+
+export interface FinishResult {
+	runId: number | null;
+	outboxId: number | null;
+	/** True when the job was no longer `running`, so someone else already had the verdict. */
+	alreadySettled: boolean;
+}
+
+/**
+ * Terminal transaction: job state, run record and outbox row land together.
+ *
+ * The notification text is written to outbox here rather than to runs, which is
+ * what keeps runs PII-free while still guaranteeing the notification survives a
+ * crash — the transactional outbox pattern's whole point.
+ */
+export function finishJob(db: Db, input: FinishInput): FinishResult {
+	return withTransaction(db, () => {
+		// `AND state = 'running'` is the whole of the guard: whoever settles a job
+		// first owns its verdict.
+		//
+		// Shutdown is where this bites. A drain that times out marks its lingering
+		// jobs `interrupted` and queues the obituaries; the job then finishes a beat
+		// later and, ungated, would flip the state back, write a second run row and
+		// send a second, contradicting notification for the same job. Measured
+		// end to end before this guard existed.
+		const changes = input.retryAt
+			? db
+					.prepare(
+						`UPDATE jobs SET state = 'pending', attempts = attempts + 1, reason = ?, scheduled_at = ?
+						 WHERE id = ? AND state = 'running'`,
+					)
+					.run(input.reason ?? null, input.retryAt, input.jobId).changes
+			: db
+					.prepare(
+						`UPDATE jobs SET state = ?, reason = ?, attempts = attempts + 1, finished_at = ?
+						 WHERE id = ? AND state = 'running'`,
+					)
+					.run(input.outcome, input.reason ?? null, nowIso(), input.jobId).changes;
+
+		if (Number(changes) === 0) return { runId: null, outboxId: null, alreadySettled: true };
+
+		const runInfo = db
+			.prepare(
+				`INSERT INTO runs (job_id, agent, pid, session_file, outcome, reason, error_summary,
+				                   input_tokens, output_tokens, cache_read, cache_write, total_tokens,
+				                   started_at, finished_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			)
+			.run(
+				input.jobId,
+				input.agent,
+				input.pid ?? null,
+				input.sessionFile ?? null,
+				input.outcome,
+				input.reason ?? null,
+				input.errorSummary ?? null,
+				input.usage?.input ?? null,
+				input.usage?.output ?? null,
+				input.usage?.cacheRead ?? null,
+				input.usage?.cacheWrite ?? null,
+				input.usage?.total ?? null,
+				input.startedAt,
+				nowIso(),
+			);
+		const runId = Number(runInfo.lastInsertRowid);
+
+		let outboxId: number | null = null;
+		if (input.notify) {
+			const body = typeof input.notify.body === "function" ? input.notify.body(runId) : input.notify.body;
+			const info = db
+				.prepare("INSERT INTO outbox (run_id, sink, body, created_at) VALUES (?, ?, ?, ?)")
+				.run(runId, input.notify.sink, body, nowIso());
+			outboxId = Number(info.lastInsertRowid);
+		}
+
+		return { runId, outboxId, alreadySettled: false };
+	});
+}
+
+/** What the operator is told about a run whose harness died under it. */
+const INTERRUPTED_SUMMARY = "the daemon stopped before this run reached a verdict; its outcome is unknown";
+
+export interface InterruptedResult {
+	jobIds: number[];
+	/** How many produced an outbox row, i.e. how many the operator will hear about. */
+	notified: number;
+}
+
+/**
+ * Marks jobs left `running` by a dead daemon as interrupted, records a run for
+ * each, and queues the notifications their policy asks for.
+ *
+ * Called at startup and again if a drain does not complete. This is an epistemic
+ * state, not a verdict about the work: the harness died, so whether the job
+ * succeeded is simply unknown.
+ *
+ * All three writes belong together. Flipping the state alone was the earlier
+ * behaviour and it silently dropped exactly the message the outbox exists to guarantee —
+ * an agent killed mid-run notified, but a daemon that died under it did not. It
+ * also left `interrupted` unreachable in `runs`, so `pi-reactor runs --dead`
+ * could never show one.
+ */
+export function markInterrupted(db: Db): InterruptedResult {
+	// A type alias, not an interface: only the former gets the implicit index
+	// signature node:sqlite's Record<string, SQLOutputValue> row type needs.
+	type Row = {
+		id: number;
+		agent: string;
+		trigger_id: string | null;
+		notify_sink: string | null;
+		notify_when: string | null;
+		started_at: string | null;
+	};
+	const rows = db
+		.prepare("SELECT id, agent, trigger_id, notify_sink, notify_when, started_at FROM jobs WHERE state = 'running'")
+		.all() as Row[];
+	if (rows.length === 0) return { jobIds: [], notified: 0 };
+
+	return withTransaction(db, () => {
+		const ts = nowIso();
+		let notified = 0;
+		for (const row of rows) {
+			db.prepare("UPDATE jobs SET state = 'interrupted', finished_at = ? WHERE id = ?").run(ts, row.id);
+			const runInfo = db
+				.prepare(
+					`INSERT INTO runs (job_id, agent, outcome, error_summary, started_at, finished_at)
+					 VALUES (?, ?, 'interrupted', ?, ?, ?)`,
+				)
+				.run(row.id, row.agent, INTERRUPTED_SUMMARY, row.started_at ?? ts, ts);
+
+			// "success" is the one policy that stays silent: an interrupted run is
+			// not a success. "failure" and "always" both want to hear about it.
+			if (row.notify_sink && row.notify_when !== "success") {
+				const label = row.trigger_id ?? `job ${row.id}`;
+				db.prepare("INSERT INTO outbox (run_id, sink, body, created_at) VALUES (?, ?, ?, ?)").run(
+					Number(runInfo.lastInsertRowid),
+					row.notify_sink,
+					`⚠️ ${label} · ${row.agent} · interrupted\n\n${INTERRUPTED_SUMMARY}`,
+					ts,
+				);
+				notified++;
+			}
+		}
+		return { jobIds: rows.map((r) => r.id), notified };
+	});
+}
+
+/**
+ * The routing of a past job, for `rerun`.
+ *
+ * Read from `jobs` rather than `runs` because `runs` is deliberately PII-free —
+ * it holds no task text, so it cannot describe what to run again.
+ */
+export interface JobRouting {
+	agent: string;
+	task: string | null;
+	skill: string | null;
+	trigger_id: string | null;
+	max_duration_s: number;
+	require_clean_tree: number;
+	retryable: number;
+	notify_sink: string | null;
+	notify_when: string | null;
+}
+
+export function readJobRouting(db: Db, jobId: number): JobRouting | undefined {
+	return db
+		.prepare(
+			`SELECT agent, task, skill, trigger_id, max_duration_s, require_clean_tree,
+			        retryable, notify_sink, notify_when
+			 FROM jobs WHERE id = ?`,
+		)
+		.get(jobId) as JobRouting | undefined;
+}
+
+export interface RunSession {
+	runId: number;
+	agent: string;
+	outcome: string | null;
+	startedAt: string;
+	/** pi's session JSONL. Null when the run died before pi got that far. */
+	sessionFile: string | null;
+}
+
+/**
+ * Where a run's transcript lives, so the operator can pick the conversation back
+ * up in their own pi (`pi --session <file>`).
+ *
+ * The path is recorded but was previously unreachable: `runs` does not return it
+ * and nothing else exposed it, so "I got the notification and want to ask a
+ * follow-up" ended at opening the database by hand.
+ */
+export function runSession(db: Db, runId: number): RunSession | undefined {
+	const row = db
+		.prepare("SELECT id, agent, outcome, started_at, session_file FROM runs WHERE id = ?")
+		.get(runId) as { id: number; agent: string; outcome: string | null; started_at: string; session_file: string | null } | undefined;
+	if (!row) return undefined;
+	return {
+		runId: row.id,
+		agent: row.agent,
+		outcome: row.outcome,
+		startedAt: row.started_at,
+		sessionFile: row.session_file,
+	};
+}
+
+/** The job a run belongs to; null for a run whose job has aged out. */
+export function jobIdForRun(db: Db, runId: number): number | null {
+	const row = db.prepare("SELECT job_id FROM runs WHERE id = ?").get(runId) as { job_id: number | null } | undefined;
+	return row?.job_id ?? null;
+}
+
+export function insertOutbox(db: Db, sink: string, body: string, runId?: number): number {
+	const info = db
+		.prepare("INSERT INTO outbox (run_id, sink, body, created_at) VALUES (?, ?, ?, ?)")
+		.run(runId ?? null, sink, body, nowIso());
+	return Number(info.lastInsertRowid);
+}
+
+/** Tokens spent since midnight UTC, the unit the budget gate counts. */
+export function tokensSpentToday(db: Db, now: Date = new Date()): number {
+	const midnight = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())).toISOString();
+	const row = db
+		.prepare("SELECT COALESCE(SUM(total_tokens), 0) AS total FROM runs WHERE started_at >= ?")
+		.get(midnight) as { total: number };
+	return row.total;
+}
+
+/**
+ * Live queue depth.
+ *
+ * No `dead` count: the schema's CHECK constraint permits that job state but
+ * nothing writes it — a retry-exhausted job settles as `failed`. Reporting a
+ * column that is structurally always zero reads as "nothing is stuck", which is
+ * a claim we cannot make. Where things actually go to die is the outbox, and
+ * that is what `outboxCounts` surfaces.
+ */
+export function queueCounts(db: Db): { pending: number; running: number } {
+	const rows = db.prepare("SELECT state, COUNT(*) AS n FROM jobs GROUP BY state").all() as {
+		state: string;
+		n: number;
+	}[];
+	const byState = Object.fromEntries(rows.map((r) => [r.state, r.n]));
+	return {
+		pending: byState.pending ?? 0,
+		running: byState.running ?? 0,
+	};
+}
+
+/**
+ * Outbox depth, including the dead-letter count.
+ *
+ * Every queue system treats DLQ depth as a first-class signal, and it is the one
+ * number that says "a notification you were promised is never coming". It was
+ * previously reachable only by opening the database with sqlite3.
+ */
+export function outboxCounts(db: Db): { pending: number; dead: number } {
+	const rows = db.prepare("SELECT state, COUNT(*) AS n FROM outbox GROUP BY state").all() as {
+		state: string;
+		n: number;
+	}[];
+	const byState = Object.fromEntries(rows.map((r) => [r.state, r.n]));
+	return { pending: byState.pending ?? 0, dead: byState.dead ?? 0 };
+}
+
+export function runsToday(db: Db, now: Date = new Date()): number {
+	const midnight = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())).toISOString();
+	const row = db.prepare("SELECT COUNT(*) AS n FROM runs WHERE started_at >= ?").get(midnight) as { n: number };
+	return row.n;
+}
+
+export function recentRuns(db: Db, limit = 20, deadOnly = false): unknown[] {
+	const where = deadOnly ? "WHERE r.outcome IN ('failed','interrupted')" : "";
+	return db
+		.prepare(
+			`SELECT r.id, r.job_id AS jobId, r.agent, r.outcome, r.reason,
+			        r.total_tokens AS totalTokens, r.started_at AS startedAt,
+			        r.finished_at AS finishedAt, r.error_summary AS errorSummary
+			 FROM runs r ${where}
+			 ORDER BY r.id DESC LIMIT ?`,
+		)
+		.all(limit);
+}
+
+// ---------------------------------------------------------------- runtime state
+
+export function getFlag(db: Db, key: string): string | null {
+	const row = db.prepare("SELECT value FROM runtime_state WHERE key = ?").get(key) as { value: string } | undefined;
+	return row?.value ?? null;
+}
+
+/** Durable across restarts, which is the point: a paused daemon comes back paused. */
+export function setFlag(db: Db, key: string, value: string): void {
+	db.prepare(
+		`INSERT INTO runtime_state (key, value, updated_at) VALUES (?, ?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+	).run(key, value, nowIso());
+}
+
+export function isPaused(db: Db): boolean {
+	return getFlag(db, "paused") === "1";
+}
+
+export { isoSecondsAgo };

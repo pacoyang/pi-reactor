@@ -1,0 +1,63 @@
+{
+  "name": "pi-reactor",
+  "version": "0.1.0",
+  "description": "Self-hosted agent event loop for the pi coding agent: cron and webhook triggers, a durable queue with spend caps, and outbound notifications to Telegram/Slack.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "pi-coding-agent",
+    "coding-agent",
+    "ai-agent",
+    "autonomous-agents",
+    "self-hosted",
+    "job-queue",
+    "cron",
+    "webhook",
+    "telegram"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "bin": {
+    "pi-reactor": "./src/cli.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./src/extension/index.ts"
+    ],
+    "skills": [
+      "./skills/operate-pi-reactor/SKILL.md"
+    ]
+  },
+  "files": [
+    "src",
+    "skills"
+  ],
+  "scripts": {
+    "test": "node --test \"test/!(*.contract).test.ts\"",
+    "test:contract": "node --test --test-timeout=120000 \"test/*.contract.test.ts\"",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "croner": "^9.1.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.82.0",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "typebox": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.82.1",
+    "@earendil-works/pi-coding-agent": "0.82.0",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.8.0"
+  }
+}
