@@ -158,3 +158,32 @@ test("the install hint matches the scope it was generated for", () => {
 	assert.match(serviceInstallHint("launchd", "system"), /sudo/, "writing there needs it, and so does loading it");
 	assert.match(serviceInstallHint("launchd", "user"), /LaunchAgents/);
 });
+
+// ------------------------------------------------------- serve options
+
+test("serve options given to `service` are written onto the unit", () => {
+	// The spend ceiling has nowhere else to live. It is not a config-file
+	// preference — it is a property of this deployment — and a service-managed
+	// daemon is started by the unit and by nothing else, so a unit that cannot
+	// carry it leaves the budget gate permanently off on the only installation
+	// that matters.
+	const args = ["--daily-token-cap", "1500000", "--concurrency", "2"];
+
+	const unit = renderServiceUnit("systemd", "system", input({ serveArgs: args }));
+	assert.match(unit, /ExecStart=\S+ \S+ serve --daily-token-cap 1500000 --concurrency 2$/m);
+
+	const plist = renderServiceUnit("launchd", "user", input({ serveArgs: args }));
+	assert.match(plist, /<string>serve<\/string>\s*<string>--daily-token-cap<\/string>\s*<string>1500000<\/string>/,
+		"launchd takes argv as elements, not as a command line");
+});
+
+test("no serve options leaves the command exactly as it was", () => {
+	// The daemon's defaults are the common case, and a unit full of flags that
+	// merely restate them is one more thing to keep in step with the code.
+	for (const kind of ["systemd", "launchd"] as const) {
+		const bare = renderServiceUnit(kind, "user", input());
+		const empty = renderServiceUnit(kind, "user", input({ serveArgs: [] }));
+		assert.equal(bare, empty, `${kind}: an empty list must render as no options`);
+		assert.doesNotMatch(bare, /--daily-token-cap|--concurrency/, kind);
+	}
+});

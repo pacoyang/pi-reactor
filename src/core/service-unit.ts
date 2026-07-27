@@ -41,6 +41,16 @@ export interface ServiceUnitInput {
 	user: string;
 	/** Set only when the operator overrode the directory, so the default stays implicit. */
 	reactorDir?: string | undefined;
+	/**
+	 * Options to hand `serve` in the unit, verbatim.
+	 *
+	 * The spend ceiling and the concurrency limit have no home in the config
+	 * JSONs — those hold references and preferences, while these are properties
+	 * of this deployment. The unit file is where they belong, so a unit that
+	 * cannot carry them leaves the budget gate with no way to be switched on for
+	 * the only way the daemon is ever really run.
+	 */
+	serveArgs?: string[] | undefined;
 }
 
 /** Defaults to whatever this machine uses. */
@@ -175,7 +185,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-${identity}ExecStart=${input.execPath} ${input.scriptPath} serve
+${identity}ExecStart=${input.execPath} ${input.scriptPath} serve${serveArgs(input)}
 
 # Agents inherit this PATH for their own tool calls — git, gh, npm. This is the
 # PATH the daemon was generated from, which is the one you tested in.
@@ -234,7 +244,7 @@ ${install}
 	<array>
 		<string>${xml(input.execPath)}</string>
 		<string>${xml(input.scriptPath)}</string>
-		<string>serve</string>
+		<string>serve</string>${serveArgsXml(input)}
 	</array>
 
 	<key>RunAtLoad</key>
@@ -272,6 +282,16 @@ ${install}
 </dict>
 </plist>
 `;
+}
+
+/** Rendered onto the ExecStart line; empty when the daemon takes its defaults. */
+function serveArgs(input: ServiceUnitInput): string {
+	const args = input.serveArgs ?? [];
+	return args.length > 0 ? ` ${args.join(" ")}` : "";
+}
+
+function serveArgsXml(input: ServiceUnitInput): string {
+	return (input.serveArgs ?? []).map((a) => `\n\t\t<string>${xml(a)}</string>`).join("");
 }
 
 /** A home directory can contain & or <; a plist that does is not valid XML. */

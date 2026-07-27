@@ -83,15 +83,26 @@ pi-reactor secret set tg botToken < /path/to/a/file      # or a pipe, never an a
 
 Do not print a token you read, either. Pipe it.
 
-**If the provider is registered by a pi extension** (rather than built in), add that
-extension to the agent's `extensions` list. Batch jobs run with `-ne`, so nothing is
-loaded that was not asked for, and the run fails at startup with `Unknown provider`.
+**If the provider is registered by a pi extension** rather than built in, name that
+extension on the agent. Batch jobs run with `-ne`, so nothing is loaded that was not
+asked for, and the run otherwise fails at startup with `Unknown provider` — at 09:00,
+not at the point you configured it. `-e` takes a path, so pass the extension's entry
+file, which `pi.extensions` in its package.json names:
+
+```bash
+pi-reactor agent add <name> --cwd <dir> --model <provider>/<model> \
+  --extension ~/.pi/agent/npm/node_modules/<pkg>/src/index.ts    # repeatable
+```
 
 ## 5. Make it survive a reboot
 
 ```bash
-pi-reactor service > <path>      # it picks user or system by whether you are root
+pi-reactor service --daily-token-cap <N> > <path>   # user or system, by whether you are root
 ```
+
+The spend ceiling belongs on the unit, not in a config file: it is a property of this
+deployment, and a service-managed daemon is started by the unit and by nothing else. Any
+`serve` option given here is written onto `ExecStart`.
 
 Follow the instructions it prints to stderr. Two failure modes to avoid:
 

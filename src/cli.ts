@@ -15,8 +15,9 @@ const USAGE = `pi-reactor — self-hosted agent event loop
 
   serve [options]              Run the daemon (singleton per directory)
   webhook [--port 8787]        Run the public webhook listener (separate process)
-  service [--systemd|--launchd] [--user|--system]
-                               Print a service definition for this install
+  service [--systemd|--launchd] [--user|--system] [serve options]
+                               Print a service definition for this install;
+                               any serve option given is written onto the unit
   emit --agent <name> [...]    Enqueue a job
   status                       Queue, spend and agent overview
   runs [--dead] [--limit N]    Recent run history
@@ -31,7 +32,7 @@ const USAGE = `pi-reactor — self-hosted agent event loop
   schedule add|rm <id>         Agent self-scheduling (inside a job; quota-limited)
 
   Config (same daemon methods the /reactor extension uses; takes effect at once):
-    agent   ls | add <name> --cwd <dir> --model <p/m> | rm <name>
+    agent   ls | add <name> --cwd <dir> --model <p/m> [--extension <path>…] | rm <name>
     sink    ls | add <name> --kind telegram --chat-id <n> | rm <name>
     trigger ls | add <id> --schedule <cron> --agent <a> --task <t> | rm <id>
     secret  set <name> <field>   Read a credential from stdin (never echoed)
@@ -57,15 +58,22 @@ const USAGE = `pi-reactor — self-hosted agent event loop
     PI_REACTOR_DIR             Override ~/.pi-reactor
 `;
 
+/** The `serve` options a unit may carry. Kept beside the flags serve itself reads. */
+const SERVE_OPTIONS = ["concurrency", "daily-token-cap", "retention-days", "shutdown-grace"] as const;
+
 interface Args {
 	command: string;
 	flags: Record<string, string | boolean>;
+	/** Every value a flag was given, in order. A flag pi itself allows more than
+	 *  once — `-e` above all — cannot be carried by a last-one-wins map. */
+	repeated: Record<string, string[]>;
 	positional: string[];
 }
 
 function parseArgs(argv: string[]): Args {
 	const [command = "", ...rest] = argv;
 	const flags: Record<string, string | boolean> = {};
+	const repeated: Record<string, string[]> = {};
 	const positional: string[] = [];
 	for (let i = 0; i < rest.length; i++) {
 		const token = rest[i] as string;
@@ -74,6 +82,7 @@ function parseArgs(argv: string[]): Args {
 			const next = rest[i + 1];
 			if (next !== undefined && !next.startsWith("--")) {
 				flags[key] = next;
+				(repeated[key] ??= []).push(next);
 				i++;
 			} else {
 				flags[key] = true;
@@ -82,7 +91,7 @@ function parseArgs(argv: string[]): Args {
 			positional.push(token);
 		}
 	}
-	return { command, flags, positional };
+	return { command, flags, repeated, positional };
 }
 
 /** Every subcommand but `serve` is a thin client over the socket. */
@@ -144,11 +153,17 @@ async function configCommand(paths: Paths, args: Args): Promise<void> {
 		const cwd = flag("cwd");
 		const model = flag("model");
 		if (!cwd || !model) fail("agent add requires --cwd <dir> and --model <provider/model-id>");
+		// Batch runs are spawned with `-ne`, so a provider that an extension
+		// registers is invisible unless that extension is named here. Without this
+		// the agent is configurable but unrunnable, and the failure arrives at the
+		// first scheduled run rather than at the point of configuration.
+		const extensions = args.repeated["extension"] ?? [];
 		params = {
 			name,
 			agent: {
 				cwd,
 				model,
+				...(extensions.length > 0 ? { extensions } : {}),
 				...(flag("max-duration") ? { maxDuration: flag("max-duration") } : {}),
 				...(flag("thinking-level") ? { thinkingLevel: flag("thinking-level") } : {}),
 			},
@@ -256,7 +271,22 @@ async function main(): Promise<void> {
 			// units and LaunchDaemons do not. Defaults from whether this is root,
 			// because a user unit on a root-only box installs fine and never starts.
 			const scope = args.flags.system === true ? "system" : args.flags.user === true ? "user" : defaultServiceScope();
-			process.stdout.write(renderServiceUnit(kind, scope, serviceUnitInput(paths)));
+			// Any `serve` option given here is written onto the unit, because that is
+			// the only place it can live: the spend ceiling is not a config-file
+			// preference, and a service-managed daemon is started by the unit and
+			// nothing else. Validated here rather than at first boot — a unit that
+			// installs cleanly and then refuses to start is the failure this whole
+			// generated-unit approach exists to avoid.
+			const serveArgs: string[] = [];
+			for (const key of SERVE_OPTIONS) {
+				const raw = args.flags[key];
+				if (raw === undefined) continue;
+				if (typeof raw !== "string") fail(`--${key} needs a value`);
+				if (key === "shutdown-grace") parseDuration(raw);
+				else if (!Number.isFinite(Number(raw)) || Number(raw) <= 0) fail(`--${key} must be a positive number, got ${raw}`);
+				serveArgs.push(`--${key}`, raw);
+			}
+			process.stdout.write(renderServiceUnit(kind, scope, { ...serviceUnitInput(paths), serveArgs }));
 			// The how-to goes to stderr so a redirect keeps the unit file clean.
 			process.stderr.write(serviceInstallHint(kind, scope));
 			return;
