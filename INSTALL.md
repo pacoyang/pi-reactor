@@ -140,11 +140,6 @@ are two different claims.
 - **pi has no web tool.** Its tools are `bash`, `edit`, `find`, `grep`, `ls`, `read`,
   `write`, and it does not speak MCP. An agent reaches the network through `bash` — `curl`
   against an API or an RSS feed. If the task needs search, that has to be arranged.
-- **The pi that runs jobs may not be the pi you type.** pi-reactor resolves its own
-  copy, and npm installs a peer at the newest matching version rather than reusing a
-  global install at an older one. `pi --version` and what `doctor` reports can differ,
-  and `doctor` is the one describing your scheduled runs. If it says the version is not
-  the verified pin, that is a real warning: the RPC protocol carries no semver promise.
 - **Do not disturb what is already there.** Other services may be running. Do not change
   the system clock, the firewall, or existing pi configuration.
 - **The agent can run commands in its working directory.** On a server that is real
