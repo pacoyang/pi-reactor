@@ -17,7 +17,8 @@ command -v pi && pi --version        # pi is the engine; without it nothing runs
 ls ~/.pi/agent/                      # auth.json, settings.json, telegram.json may exist
 ls ~/.pi-reactor/                    # already installed? do not overwrite a working setup
 systemctl is-system-running          # and whether `systemctl --user` works at all
-date; timedatectl show -p Timezone --value
+date                                 # the zone is in the output; timedatectl needs a
+                                     # system bus a container usually does not have
 curl -sS -o /dev/null -w '%{http_code}' https://api.github.com    # can agents reach out?
 ```
 
@@ -43,9 +44,13 @@ conflicts.
 ## 2. Install
 
 ```bash
-npm install -g pi-reactor
-pi-reactor doctor        # expect failures here; it lists what is still missing
+npm install -g pi-reactor    # the CLI and the daemon
+pi install npm:pi-reactor    # the /reactor extension and its skill, inside pi
+pi-reactor doctor            # expect failures here; it lists what is still missing
 ```
+
+Both halves, or `/reactor` is missing from the pi you are standing in and `doctor` ends up
+suggesting a command that was never installed.
 
 ## 3. Ask before configuring
 
@@ -72,8 +77,11 @@ all print `daemon not running` and exit 1 — so the service comes before the co
 not after it.
 
 ```bash
-pi-reactor service --daily-token-cap <N> > <path>   # user or system, by whether you are root
+pi-reactor service --daily-token-cap <N>            # user or system, by whether you are root
 ```
+
+It prints the unit on stdout and where to put it on stderr, so run it once without a
+redirect, read the destination it names, then run it again redirected there.
 
 The spend ceiling belongs on the unit, not in a config file: it is a property of this
 deployment, and a service-managed daemon is started by the unit and by nothing else. Any
