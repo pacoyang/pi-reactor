@@ -41,7 +41,7 @@ export interface Check {
  * so compatibility is asserted only for the minor the contract tests cover.
  */
 const SUPPORTED_PI_MINOR = "0.82";
-export const SUPPORTED_PI_RANGE = `${SUPPORTED_PI_MINOR}.x`;
+const SUPPORTED_PI_RANGE = `${SUPPORTED_PI_MINOR}.x`;
 
 export function piVersionSupported(version: string): boolean {
 	// The full x.y.z shape is required: "0.82" is not a release, and matching it
