@@ -281,6 +281,7 @@ to your own `~/.pi/agent/auth.json`, so `pi login` is usually all the setup ther
 ```
 serve [options]              Run the daemon (singleton per directory)
 webhook [--port 8787]        Run the public webhook listener
+service [--user|--system]    Print a service definition for this install
 emit --agent <name> [...]    Enqueue a job now
 status                       Queue depth, dead letters, today's spend
 runs [--dead] [--limit N]    Recent run history
@@ -448,9 +449,23 @@ launchctl load ~/Library/LaunchAgents/dev.pi-reactor.daemon.plist
 tail -f ~/Library/Logs/pi-reactor.log
 ```
 
-**`enable-linger` is not optional on a server.** Without it the user manager stops when
-your session ends, so the daemon dies with your SSH connection and the 09:00 schedule
+**`enable-linger` is not optional for a user service.** Without it the user manager stops
+when your session ends, so the daemon dies with your SSH connection and the 09:00 schedule
 never fires. It is the most common way a personal daemon quietly stops working.
+
+### User or system
+
+Scope is a separate axis from the init system, and both have it: systemd has `--user`
+units and system units, launchd has LaunchAgents and LaunchDaemons. `service` picks by
+whether you are root — root installs system services, and on a server or in a container
+there is often no user session for a user unit to attach to at all. Override with `--user`
+or `--system`.
+
+The system variant targets `multi-user.target` rather than `default.target`, names the
+account with `User=`, and carries its own `HOME` — a system unit inherits none, while the
+daemon reads `~/.pi-reactor` and the agent reads `~/.pi/agent`. Getting this wrong is
+quiet: a user unit installs cleanly on a root-only box and then never starts, with systemd
+reporting only that it cannot reach a session bus.
 
 The definition is generated rather than shipped as a file to edit, because the values that
 matter are ones only a running process knows: the absolute path to *this* node, to *this*
