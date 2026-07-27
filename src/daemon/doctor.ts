@@ -61,7 +61,7 @@ export async function runDoctor(paths: Paths): Promise<Check[]> {
 		fix: "upgrade Node: type stripping without a build step needs 22.19 or newer",
 	});
 
-	checks.push(pinnedPiCheck());
+	checks.push(piVersionCheck());
 
 	// ---- directory ------------------------------------------------------
 	checks.push({
@@ -237,7 +237,7 @@ export async function runDoctor(paths: Paths): Promise<Check[]> {
  * `/compat` and `/rpc-entry`). Instead resolve the one subpath that IS exported
  * and walk up from dist/ to the package root.
  */
-function pinnedPiCheck(): Check {
+function piVersionCheck(): Check {
 	try {
 		const packageRoot = dirname(dirname(resolveRpcEntry()));
 		const pkg = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as { version?: string };
