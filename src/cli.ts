@@ -31,7 +31,7 @@ const USAGE = `pi-reactor — self-hosted agent event loop
   schedule add|rm <id>         Agent self-scheduling (inside a job; quota-limited)
 
   Config (same daemon methods the /reactor extension uses; takes effect at once):
-    agent   ls | add <name> --cwd <dir> --model <p/m> | rm <name>
+    agent   ls | add <name> --cwd <dir> --model <p/m> [--extension <path>…] | rm <name>
     sink    ls | add <name> --kind telegram --chat-id <n> | rm <name>
     trigger ls | add <id> --schedule <cron> --agent <a> --task <t> | rm <id>
     secret  set <name> <field>   Read a credential from stdin (never echoed)
@@ -60,12 +60,16 @@ const USAGE = `pi-reactor — self-hosted agent event loop
 interface Args {
 	command: string;
 	flags: Record<string, string | boolean>;
+	/** Every value a flag was given, in order. A flag pi itself allows more than
+	 *  once — `-e` above all — cannot be carried by a last-one-wins map. */
+	repeated: Record<string, string[]>;
 	positional: string[];
 }
 
 function parseArgs(argv: string[]): Args {
 	const [command = "", ...rest] = argv;
 	const flags: Record<string, string | boolean> = {};
+	const repeated: Record<string, string[]> = {};
 	const positional: string[] = [];
 	for (let i = 0; i < rest.length; i++) {
 		const token = rest[i] as string;
@@ -74,6 +78,7 @@ function parseArgs(argv: string[]): Args {
 			const next = rest[i + 1];
 			if (next !== undefined && !next.startsWith("--")) {
 				flags[key] = next;
+				(repeated[key] ??= []).push(next);
 				i++;
 			} else {
 				flags[key] = true;
@@ -82,7 +87,7 @@ function parseArgs(argv: string[]): Args {
 			positional.push(token);
 		}
 	}
-	return { command, flags, positional };
+	return { command, flags, repeated, positional };
 }
 
 /** Every subcommand but `serve` is a thin client over the socket. */
@@ -144,11 +149,17 @@ async function configCommand(paths: Paths, args: Args): Promise<void> {
 		const cwd = flag("cwd");
 		const model = flag("model");
 		if (!cwd || !model) fail("agent add requires --cwd <dir> and --model <provider/model-id>");
+		// Batch runs are spawned with `-ne`, so a provider that an extension
+		// registers is invisible unless that extension is named here. Without this
+		// the agent is configurable but unrunnable, and the failure arrives at the
+		// first scheduled run rather than at the point of configuration.
+		const extensions = args.repeated["extension"] ?? [];
 		params = {
 			name,
 			agent: {
 				cwd,
 				model,
+				...(extensions.length > 0 ? { extensions } : {}),
 				...(flag("max-duration") ? { maxDuration: flag("max-duration") } : {}),
 				...(flag("thinking-level") ? { thinkingLevel: flag("thinking-level") } : {}),
 			},
