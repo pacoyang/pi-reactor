@@ -7,7 +7,7 @@
  *. Protocol semantics mirror it; the contract test still
  * anchors on upstream.
  *
- * Six hard constraints, each established by running against the pinned 0.82.0:
+ * Six hard constraints, each established by running against the pinned 0.82.1:
  *  1. Completion is `agent_settled` ONLY. `agent_end` can be followed by a retry
  *     or continuation, and `prompt`'s response is just a preflight ack.
  *  2. Frames must be split on LF only. Upstream dropped readline because U+2028

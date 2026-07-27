@@ -1,6 +1,6 @@
 /**
  * Verifies every RPC contract we depend on against the PUBLISHED build that the
- * lockfile resolves, `@earendil-works/pi-coding-agent@0.82.0`.
+ * lockfile resolves, `@earendil-works/pi-coding-agent@0.82.1`.
  *
  * This is the upgrade gate: run it before upgrading pi. A failure means upstream
  * drifted — change the design first, then the code.

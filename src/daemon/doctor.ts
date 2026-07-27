@@ -31,7 +31,7 @@ export interface Check {
 }
 
 /** The pi release this build's contract tests were verified against. */
-export const PINNED_PI_VERSION = "0.82.0";
+export const PINNED_PI_VERSION = "0.82.1";
 
 export async function runDoctor(paths: Paths): Promise<Check[]> {
 	const checks: Check[] = [];
