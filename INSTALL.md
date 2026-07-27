@@ -65,7 +65,31 @@ Do not guess these. Ask, then configure:
 you cannot convert it exactly — pricing depends on the provider and model — propose a
 conservative token number, and suggest reconciling against the first real bill.
 
-## 4. Configure
+## 4. Start it, so there is something to configure
+
+Every command below `serve` is a client over a unix socket. With no daemon running they
+all print `daemon not running` and exit 1 — so the service comes before the configuration,
+not after it.
+
+```bash
+pi-reactor service --daily-token-cap <N> > <path>   # user or system, by whether you are root
+```
+
+The spend ceiling belongs on the unit, not in a config file: it is a property of this
+deployment, and a service-managed daemon is started by the unit and by nothing else. Any
+`serve` option given here is written onto `ExecStart`.
+
+Follow the instructions it prints to stderr. Two failure modes to avoid:
+
+- A **user** service needs `loginctl enable-linger`, or it dies when the SSH session ends.
+- A **user** service does not work at all where there is no session bus — containers,
+  most root-only servers. `systemctl --user` fails with a message about
+  `$DBUS_SESSION_BUS_ADDRESS`. Use `--system` there.
+
+Regenerate rather than hand-editing: the paths in the file come from the install it was
+generated on.
+
+## 5. Configure
 
 ```bash
 pi-reactor agent add <name> --cwd <dir> --model <provider>/<model>
@@ -94,25 +118,9 @@ pi-reactor agent add <name> --cwd <dir> --model <provider>/<model> \
   --extension ~/.pi/agent/npm/node_modules/<pkg>/src/index.ts    # repeatable
 ```
 
-## 5. Make it survive a reboot
-
-```bash
-pi-reactor service --daily-token-cap <N> > <path>   # user or system, by whether you are root
-```
-
-The spend ceiling belongs on the unit, not in a config file: it is a property of this
-deployment, and a service-managed daemon is started by the unit and by nothing else. Any
-`serve` option given here is written onto `ExecStart`.
-
-Follow the instructions it prints to stderr. Two failure modes to avoid:
-
-- A **user** service needs `loginctl enable-linger`, or it dies when the SSH session ends.
-- A **user** service does not work at all where there is no session bus — containers,
-  most root-only servers. `systemctl --user` fails with a message about
-  `$DBUS_SESSION_BUS_ADDRESS`. Use `--system` there.
-
-Regenerate rather than hand-editing: the paths in the file come from the install it was
-generated on.
+Read the agent back afterwards. `agent ls` is the only place the allowlist is visible,
+and an empty one on a machine whose provider comes from an extension means the first
+scheduled run will fail.
 
 ## 6. Verify, end to end
 
@@ -132,6 +140,11 @@ are two different claims.
 - **pi has no web tool.** Its tools are `bash`, `edit`, `find`, `grep`, `ls`, `read`,
   `write`, and it does not speak MCP. An agent reaches the network through `bash` — `curl`
   against an API or an RSS feed. If the task needs search, that has to be arranged.
+- **The pi that runs jobs may not be the pi you type.** pi-reactor resolves its own
+  copy, and npm installs a peer at the newest matching version rather than reusing a
+  global install at an older one. `pi --version` and what `doctor` reports can differ,
+  and `doctor` is the one describing your scheduled runs. If it says the version is not
+  the verified pin, that is a real warning: the RPC protocol carries no semver promise.
 - **Do not disturb what is already there.** Other services may be running. Do not change
   the system clock, the firewall, or existing pi configuration.
 - **The agent can run commands in its working directory.** On a server that is real
