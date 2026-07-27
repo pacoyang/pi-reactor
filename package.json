@@ -17,6 +17,12 @@
     "telegram"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pacoyang/pi-reactor.git"
+  },
+  "homepage": "https://github.com/pacoyang/pi-reactor#readme",
+  "bugs": "https://github.com/pacoyang/pi-reactor/issues",
   "type": "module",
   "engines": {
     "node": ">=22.19.0"
