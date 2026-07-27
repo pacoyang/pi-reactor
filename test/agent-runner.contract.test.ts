@@ -1,8 +1,9 @@
 /**
- * Verifies every RPC contract we depend on against the PUBLISHED build that the
- * lockfile resolves, `@earendil-works/pi-coding-agent@0.82.1`.
+ * Verifies every RPC contract we depend on against the PUBLISHED build the
+ * lockfile resolves — today `@earendil-works/pi-coding-agent@0.82.1`.
  *
- * This is the upgrade gate: run it before upgrading pi. A failure means upstream
+ * This is the upgrade gate: run it before widening the supported range in
+ * doctor.ts, and after any `npm update` that moves pi. A failure means upstream
  * drifted — change the design first, then the code.
  *
  * Content-level cases need a working provider; without one they SKIP and say so
