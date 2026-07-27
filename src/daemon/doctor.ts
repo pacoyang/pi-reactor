@@ -30,8 +30,24 @@ export interface Check {
 	note?: string;
 }
 
-/** The pi release this build's contract tests were verified against. */
-export const PINNED_PI_VERSION = "0.82.0";
+/**
+ * The pi releases this build is prepared to run against.
+ *
+ * A range rather than one version, because a package states compatibility and a
+ * lockfile states what was installed — pinning an exact version here would claim
+ * that every other release is broken, which is a claim nothing has tested.
+ *
+ * The upper bound is real, though: the RPC protocol carries no semver promise,
+ * so compatibility is asserted only for the minor the contract tests cover.
+ */
+const SUPPORTED_PI_MINOR = "0.82";
+const SUPPORTED_PI_RANGE = `${SUPPORTED_PI_MINOR}.x`;
+
+export function piVersionSupported(version: string): boolean {
+	// The full x.y.z shape is required: "0.82" is not a release, and matching it
+	// would let a truncated or unread version pass as supported.
+	return /^(\d+\.\d+)\.\d+/.exec(version)?.[1] === SUPPORTED_PI_MINOR;
+}
 
 export async function runDoctor(paths: Paths): Promise<Check[]> {
 	const checks: Check[] = [];
@@ -45,7 +61,7 @@ export async function runDoctor(paths: Paths): Promise<Check[]> {
 		fix: "upgrade Node: type stripping without a build step needs 22.19 or newer",
 	});
 
-	checks.push(pinnedPiCheck());
+	checks.push(piVersionCheck());
 
 	// ---- directory ------------------------------------------------------
 	checks.push({
@@ -221,17 +237,17 @@ export async function runDoctor(paths: Paths): Promise<Check[]> {
  * `/compat` and `/rpc-entry`). Instead resolve the one subpath that IS exported
  * and walk up from dist/ to the package root.
  */
-function pinnedPiCheck(): Check {
+function piVersionCheck(): Check {
 	try {
 		const packageRoot = dirname(dirname(resolveRpcEntry()));
 		const pkg = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as { version?: string };
 		const version = pkg.version ?? "unknown";
 		return {
-			ok: version === PINNED_PI_VERSION,
-			label: `pi ${version} matches the verified pin (${PINNED_PI_VERSION})`,
+			ok: piVersionSupported(version),
+			label: `pi ${version} is supported (${SUPPORTED_PI_RANGE})`,
 			fix:
-				`the RPC protocol carries no semver promise, so a different version may have drifted. ` +
-				`Run \`npm run test:contract\` before relying on it.`,
+				`the RPC protocol carries no semver promise across minors, and nothing has tested this one. ` +
+				`Install a supported release, or run \`npm run test:contract\` against it and widen the range if it passes.`,
 		};
 	} catch (err) {
 		return {
