@@ -15,7 +15,8 @@ const USAGE = `pi-reactor — self-hosted agent event loop
 
   serve [options]              Run the daemon (singleton per directory)
   webhook [--port 8787]        Run the public webhook listener (separate process)
-  service [--systemd|--launchd] Print a service definition for this install
+  service [--systemd|--launchd] [--user|--system]
+                               Print a service definition for this install
   emit --agent <name> [...]    Enqueue a job
   status                       Queue, spend and agent overview
   runs [--dead] [--limit N]    Recent run history
@@ -247,12 +248,17 @@ async function main(): Promise<void> {
 			// Printed, not installed: nothing lands in a system location without you
 			// asking, and you can read it first. The shape `podman generate systemd`
 			// and `gh completion` both use.
-			const { defaultServiceKind, serviceUnitInput, renderServiceUnit, serviceInstallHint } =
+			const { defaultServiceKind, defaultServiceScope, serviceUnitInput, renderServiceUnit, serviceInstallHint } =
 				await import("./core/service-unit.ts");
 			const kind = args.flags.launchd === true ? "launchd" : args.flags.systemd === true ? "systemd" : defaultServiceKind();
-			process.stdout.write(renderServiceUnit(kind, serviceUnitInput(paths)));
+			// Scope is a separate axis from the init system, and both have it: systemd
+			// --user units and launchd LaunchAgents belong to a login session; system
+			// units and LaunchDaemons do not. Defaults from whether this is root,
+			// because a user unit on a root-only box installs fine and never starts.
+			const scope = args.flags.system === true ? "system" : args.flags.user === true ? "user" : defaultServiceScope();
+			process.stdout.write(renderServiceUnit(kind, scope, serviceUnitInput(paths)));
 			// The how-to goes to stderr so a redirect keeps the unit file clean.
-			process.stderr.write(serviceInstallHint(kind));
+			process.stderr.write(serviceInstallHint(kind, scope));
 			return;
 		}
 
