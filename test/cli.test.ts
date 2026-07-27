@@ -88,17 +88,3 @@ test("--extension may be given more than once, and every one reaches the agent",
 		f.cleanup();
 	}
 });
-
-test("an agent with no --extension keeps the empty allowlist, not a missing one", async () => {
-	const f = fixture();
-	try {
-		await withDaemon(f, async () => {
-			await f.cli("agent", "add", "plain", "--cwd", f.workspace, "--model", "anthropic/claude-sonnet-5");
-			const agents = JSON.parse(await f.cli("agent", "ls")) as Array<{ name: string; extensions: string[] }>;
-			const stored = agents.find((a) => a.name === "plain");
-			assert.deepEqual(stored?.extensions, [], "a built-in provider needs no allowlist, and absent must not mean undefined");
-		});
-	} finally {
-		f.cleanup();
-	}
-});

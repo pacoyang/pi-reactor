@@ -23,10 +23,6 @@ import { errorSummary } from "./logger.ts";
 
 export interface Check {
 	ok: boolean;
-	/** True when the check passed but something is worth saying out loud. Renders
-	 *  as `!` and does not fail the command: a doctor that goes red for things
-	 *  that are merely unverified teaches people to stop reading it. */
-	warn?: boolean;
 	label: string;
 	/** What to do about it. Only meaningful when ok is false. */
 	fix?: string;
@@ -44,35 +40,13 @@ export interface Check {
  * The upper bound is real, though: the RPC protocol carries no semver promise,
  * so compatibility is asserted only for the minor the contract tests cover.
  */
-const SUPPORTED_PI_MIN = "0.82.0";
-const SUPPORTED_PI_BELOW = "0.83.0";
-export const SUPPORTED_PI_RANGE = `>=${SUPPORTED_PI_MIN} <${SUPPORTED_PI_BELOW}`;
+const SUPPORTED_PI_MINOR = "0.82";
+export const SUPPORTED_PI_RANGE = `${SUPPORTED_PI_MINOR}.x`;
 
-/** The one release the contract tests were last actually run against. Provenance,
- *  not a constraint: it decides what to say, never whether to fail. */
-export const VERIFIED_PI_VERSION = "0.82.1";
-
-function parseVersion(value: string): [number, number, number] | null {
-	const m = /^(\d+)\.(\d+)\.(\d+)/.exec(value);
-	return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
-}
-
-function compareVersions(a: [number, number, number], b: [number, number, number]): number {
-	for (let i = 0; i < 3; i++) {
-		const d = (a[i] as number) - (b[i] as number);
-		if (d !== 0) return d;
-	}
-	return 0;
-}
-
-/** Whether a pi release is inside the range this build claims to support. */
 export function piVersionSupported(version: string): boolean {
-	const v = parseVersion(version);
-	if (!v) return false;
-	return (
-		compareVersions(v, parseVersion(SUPPORTED_PI_MIN) as [number, number, number]) >= 0 &&
-		compareVersions(v, parseVersion(SUPPORTED_PI_BELOW) as [number, number, number]) < 0
-	);
+	// The full x.y.z shape is required: "0.82" is not a release, and matching it
+	// would let a truncated or unread version pass as supported.
+	return /^(\d+\.\d+)\.\d+/.exec(version)?.[1] === SUPPORTED_PI_MINOR;
 }
 
 export async function runDoctor(paths: Paths): Promise<Check[]> {
@@ -268,25 +242,12 @@ function pinnedPiCheck(): Check {
 		const packageRoot = dirname(dirname(resolveRpcEntry()));
 		const pkg = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as { version?: string };
 		const version = pkg.version ?? "unknown";
-		if (!piVersionSupported(version)) {
-			return {
-				ok: false,
-				label: `pi ${version} is outside the supported range (${SUPPORTED_PI_RANGE})`,
-				fix:
-					`the RPC protocol carries no semver promise across minors, and nothing has tested this one. ` +
-					`Install a supported release, or run \`npm run test:contract\` against it and widen the range if it passes.`,
-			};
-		}
-		// Inside the range but not the release the tests were run against: worth
-		// saying, not worth failing. Red here would fire on every upstream patch,
-		// and a check that is usually red stops being read.
 		return {
-			ok: true,
-			...(version === VERIFIED_PI_VERSION ? {} : { warn: true }),
+			ok: piVersionSupported(version),
 			label: `pi ${version} is supported (${SUPPORTED_PI_RANGE})`,
-			...(version === VERIFIED_PI_VERSION
-				? {}
-				: { note: `contract tests last verified ${VERIFIED_PI_VERSION}; run \`npm run test:contract\` before relying on this one` }),
+			fix:
+				`the RPC protocol carries no semver promise across minors, and nothing has tested this one. ` +
+				`Install a supported release, or run \`npm run test:contract\` against it and widen the range if it passes.`,
 		};
 	} catch (err) {
 		return {
@@ -384,7 +345,7 @@ export function formatChecks(checks: Check[]): { text: string; ok: boolean } {
 	let ok = true;
 	for (const check of checks) {
 		if (!check.ok) ok = false;
-		const mark = check.ok ? (check.warn ? "!" : "✓") : "✗";
+		const mark = check.ok ? "✓" : "✗";
 		lines.push(`${mark} ${check.label}${check.note ? `  (${check.note})` : ""}`);
 		if (!check.ok && check.fix) lines.push(`    → ${check.fix}`);
 	}
