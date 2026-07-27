@@ -15,8 +15,9 @@ const USAGE = `pi-reactor — self-hosted agent event loop
 
   serve [options]              Run the daemon (singleton per directory)
   webhook [--port 8787]        Run the public webhook listener (separate process)
-  service [--systemd|--launchd] [--user|--system]
-                               Print a service definition for this install
+  service [--systemd|--launchd] [--user|--system] [serve options]
+                               Print a service definition for this install;
+                               any serve option given is written onto the unit
   emit --agent <name> [...]    Enqueue a job
   status                       Queue, spend and agent overview
   runs [--dead] [--limit N]    Recent run history
@@ -56,6 +57,9 @@ const USAGE = `pi-reactor — self-hosted agent event loop
   Global:
     PI_REACTOR_DIR             Override ~/.pi-reactor
 `;
+
+/** The `serve` options a unit may carry. Kept beside the flags serve itself reads. */
+const SERVE_OPTIONS = ["concurrency", "daily-token-cap", "retention-days", "shutdown-grace"] as const;
 
 interface Args {
 	command: string;
@@ -267,7 +271,22 @@ async function main(): Promise<void> {
 			// units and LaunchDaemons do not. Defaults from whether this is root,
 			// because a user unit on a root-only box installs fine and never starts.
 			const scope = args.flags.system === true ? "system" : args.flags.user === true ? "user" : defaultServiceScope();
-			process.stdout.write(renderServiceUnit(kind, scope, serviceUnitInput(paths)));
+			// Any `serve` option given here is written onto the unit, because that is
+			// the only place it can live: the spend ceiling is not a config-file
+			// preference, and a service-managed daemon is started by the unit and
+			// nothing else. Validated here rather than at first boot — a unit that
+			// installs cleanly and then refuses to start is the failure this whole
+			// generated-unit approach exists to avoid.
+			const serveArgs: string[] = [];
+			for (const key of SERVE_OPTIONS) {
+				const raw = args.flags[key];
+				if (raw === undefined) continue;
+				if (typeof raw !== "string") fail(`--${key} needs a value`);
+				if (key === "shutdown-grace") parseDuration(raw);
+				else if (!Number.isFinite(Number(raw)) || Number(raw) <= 0) fail(`--${key} must be a positive number, got ${raw}`);
+				serveArgs.push(`--${key}`, raw);
+			}
+			process.stdout.write(renderServiceUnit(kind, scope, { ...serviceUnitInput(paths), serveArgs }));
 			// The how-to goes to stderr so a redirect keeps the unit file clean.
 			process.stderr.write(serviceInstallHint(kind, scope));
 			return;

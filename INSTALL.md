@@ -97,8 +97,12 @@ pi-reactor agent add <name> --cwd <dir> --model <provider>/<model> \
 ## 5. Make it survive a reboot
 
 ```bash
-pi-reactor service > <path>      # it picks user or system by whether you are root
+pi-reactor service --daily-token-cap <N> > <path>   # user or system, by whether you are root
 ```
+
+The spend ceiling belongs on the unit, not in a config file: it is a property of this
+deployment, and a service-managed daemon is started by the unit and by nothing else. Any
+`serve` option given here is written onto `ExecStart`.
 
 Follow the instructions it prints to stderr. Two failure modes to avoid:
 
