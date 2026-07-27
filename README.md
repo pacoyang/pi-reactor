@@ -1,5 +1,9 @@
 # pi-reactor
 
+[![npm](https://img.shields.io/npm/v/pi-reactor?style=flat-square)](https://www.npmjs.com/package/pi-reactor)
+[![node](https://img.shields.io/node/v/pi-reactor?style=flat-square)](https://nodejs.org)
+[![license](https://img.shields.io/npm/l/pi-reactor?style=flat-square)](LICENSE)
+
 **Scheduled and event-driven work for the [Pi coding agent](https://github.com/earendil-works/pi).**
 
 Pi is a good coding agent, but it is *passive* — it works while you type. `pi-reactor`
@@ -14,12 +18,27 @@ your phone, use [`pi-telegram`](https://github.com/llblab/pi-telegram); the two 
 complementary and share nothing but the agent.
 
 ```
-sources                       daemon                         sinks
-┌ cron (built in)  ┐                                      ┌ Telegram
-├ GitHub webhook   ┼──► queue ──► spawn pi --mode rpc ──►  ┤
-└ CLI / scripts    ┘        budget · timeout · retry       └ Slack
-                            · circuit breaker
+sources                    daemon                         sinks
+cron · webhook · CLI  ──►  queue · gates · spawn pi  ──►  Telegram · Slack
 ```
+
+## Table of Contents
+
+- [Install](#install)
+- [Quick Start](#quick-start)
+- [Core Concepts](#core-concepts)
+- [The Loop](#the-loop)
+- [Triggers](#triggers)
+- [Notifications and Follow-up](#notifications-and-follow-up)
+- [Webhooks](#webhooks)
+- [Configuration](#configuration)
+- [CLI](#cli)
+- [Pi Extension](#pi-extension)
+- [Agents Scheduling Themselves](#agents-scheduling-themselves)
+- [Safety Boundaries](#safety-boundaries)
+- [Running as a Service](#running-as-a-service)
+- [Development](#development)
+- [License](#license)
 
 ## Install
 
@@ -147,7 +166,7 @@ rule that decides which triggers it wakes.
 Whatever fired the run is appended to the agent's prompt as a JSON block. "Fix the issue"
 is not a usable instruction without knowing which issue.
 
-## Notifications, and Continuing the Conversation
+## Notifications and Follow-up
 
 A notification carries the agent's final answer, the cost, and a way back in:
 
