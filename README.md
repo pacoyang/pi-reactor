@@ -30,6 +30,10 @@ pi install npm:pi-reactor    # the /reactor extension and its skill, inside your
 
 Requires Node 22.19+ and a Pi install the daemon can spawn.
 
+Setting this up on a server, or letting an agent do it for you?
+[INSTALL.md](INSTALL.md) is written for an agent to read: what to check before touching the machine, what to ask
+you before configuring anything, and the failures that are quiet rather than loud.
+
 ## Quick Start
 
 ```bash
