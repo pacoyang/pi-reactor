@@ -1,6 +1,6 @@
 {
   "name": "pi-reactor",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Self-hosted agent event loop for the pi coding agent: cron and webhook triggers, a durable queue with spend caps, and outbound notifications to Telegram/Slack.",
   "keywords": [
     "pi-package",
