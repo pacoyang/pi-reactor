@@ -218,7 +218,6 @@ async function configCommand(paths: Paths, args: Args): Promise<void> {
 	reportConfigChange(result, `${kind} ${name} added`);
 }
 
-
 /**
  * The entry in the shape `edit` has to send back.
  *
@@ -226,7 +225,13 @@ async function configCommand(paths: Paths, args: Args): Promise<void> {
  * runtime view — a trigger comes back with `kind`/`id` hoisted to the top level
  * and defaults filled in — while `edit` replaces the on-disk entry, which nests
  * them under `on`. Feeding one to the other rewrites the trigger into a shape
- * the daemon then rejects.
+ * the daemon then rejects, which is what the trigger test caught.
+ *
+ * Reading a file the daemon owns is a compromise: no RPC exposes the raw entry,
+ * and the daemon writes atomically, so a read sees the last committed state. The
+ * exposure is a write landing between this read and the edit below, which would
+ * lose that write. Narrow enough for a single operator; the fix, if it ever
+ * matters, is a merge on the daemon side rather than here.
  */
 function currentEntry(
 	paths: Paths,
