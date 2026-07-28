@@ -6,6 +6,7 @@
  * the unix socket. That split is what lets the same methods back both the CLI and
  * the pi extension without either drifting.
  */
+import { readFileSync } from "node:fs";
 import { resolvePaths, type Paths } from "./core/paths.ts";
 import { callDaemon } from "./core/rpc-client.ts";
 import type { StatusResult } from "./core/rpc-types.ts";
@@ -35,6 +36,7 @@ const USAGE = `pi-reactor — self-hosted agent event loop
     agent   ls | add <name> --cwd <dir> --model <p/m> [--extension <path>…] | rm <name>
     sink    ls | add <name> --kind telegram --chat-id <n> | rm <name>
     trigger ls | add <id> --schedule <cron> --agent <a> --task <t> | rm <id>
+    <kind>  edit <name> [same flags]   Change only the flags you pass
     secret  set <name> <field>   Read a credential from stdin (never echoed)
     Add --dry-run to any write to see the before/after without applying it.
 
@@ -111,7 +113,7 @@ async function readStdin(): Promise<string> {
 }
 
 /**
- * `agent|sink|trigger  ls|add|rm`.
+ * `agent|sink|trigger  ls|add|edit|rm`.
  *
  * A thin shell over the same JSON-RPC methods the extension calls, so the two
  * cannot drift. The flags cover the common shape; anything richer is
@@ -144,7 +146,22 @@ async function configCommand(paths: Paths, args: Args): Promise<void> {
 		return;
 	}
 
-	if (sub !== "add") fail(`unknown ${kind} subcommand "${sub}" (ls | add | rm)`);
+	// `edit` replaces the whole entry daemon-side, so the flags given here are
+	// merged onto the current one first. Without that, `agent edit x --extension y`
+	// would silently drop cwd and model — which is exactly the shape of change
+	// people reach for edit to make.
+	if (sub === "edit") {
+		const current = currentEntry(paths, kind, name);
+		if (!current) fail(`no ${kind} "${name}"`);
+		const merged = mergeEntry(kind, current, args);
+		const params =
+			kind === "trigger" ? { id: name, trigger: merged } : { name, [kind]: merged };
+		const result = (await rpcCall(paths, `${kind}.edit`, { ...params, dryRun })) as ConfigChange;
+		reportConfigChange(result, `${kind} ${name} updated`);
+		return;
+	}
+
+	if (sub !== "add") fail(`unknown ${kind} subcommand "${sub}" (ls | add | edit | rm)`);
 
 	const flag = (key: string): string | undefined => (typeof args.flags[key] === "string" ? args.flags[key] : undefined);
 	let params: Record<string, unknown>;
@@ -199,6 +216,92 @@ async function configCommand(paths: Paths, args: Args): Promise<void> {
 
 	const result = (await rpcCall(paths, `${kind}.add`, { ...params, dryRun })) as ConfigChange;
 	reportConfigChange(result, `${kind} ${name} added`);
+}
+
+
+/**
+ * The entry in the shape `edit` has to send back.
+ *
+ * Read from the config file rather than from `ls`: `ls` reports the normalised
+ * runtime view — a trigger comes back with `kind`/`id` hoisted to the top level
+ * and defaults filled in — while `edit` replaces the on-disk entry, which nests
+ * them under `on`. Feeding one to the other rewrites the trigger into a shape
+ * the daemon then rejects.
+ */
+function currentEntry(
+	paths: Paths,
+	kind: "agent" | "sink" | "trigger",
+	name: string,
+): Record<string, unknown> | undefined {
+	const file = kind === "agent" ? paths.agentsFile : kind === "sink" ? paths.sinksFile : paths.triggersFile;
+	let parsed: Record<string, unknown>;
+	try {
+		parsed = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+	} catch {
+		return undefined;
+	}
+	if (kind === "trigger") {
+		const list = (parsed.triggers as Record<string, unknown>[] | undefined) ?? [];
+		return list.find((row) => (row.on as { id?: string } | undefined)?.id === name);
+	}
+	const map = (parsed[`${kind}s`] as Record<string, Record<string, unknown>> | undefined) ?? {};
+	return map[name];
+}
+
+/**
+ * Applies the flags that were given, leaving every other field as it was.
+ *
+ * `--extension` replaces the list rather than appending: an edit that could only
+ * grow it would have no way to remove one, and repeating the flag already
+ * expresses the full set.
+ */
+function mergeEntry(
+	kind: "agent" | "sink" | "trigger",
+	current: Record<string, unknown>,
+	args: Args,
+): Record<string, unknown> {
+	const flag = (key: string): string | undefined =>
+		typeof args.flags[key] === "string" ? args.flags[key] : undefined;
+	const set = (target: Record<string, unknown>, key: string, value: unknown): void => {
+		if (value !== undefined) target[key] = value;
+	};
+
+	if (kind === "agent") {
+		const next: Record<string, unknown> = { ...current };
+		set(next, "cwd", flag("cwd"));
+		set(next, "model", flag("model"));
+		set(next, "maxDuration", flag("max-duration"));
+		set(next, "thinkingLevel", flag("thinking-level"));
+		const extensions = args.repeated["extension"];
+		if (extensions && extensions.length > 0) next.extensions = extensions;
+		return next;
+	}
+
+	if (kind === "sink") {
+		const next: Record<string, unknown> = { ...current };
+		set(next, "kind", flag("kind"));
+		if (flag("chat-id")) next.chatId = Number(flag("chat-id"));
+		return next;
+	}
+
+	const on = { ...((current.on as Record<string, unknown>) ?? {}) };
+	const run = { ...((current.run as Record<string, unknown>) ?? {}) };
+	const notify = { ...((current.notify as Record<string, unknown>) ?? {}) };
+	set(on, "schedule", flag("schedule"));
+	set(on, "timezone", flag("timezone"));
+	set(on, "misfirePolicy", flag("misfire-policy"));
+	set(run, "agent", flag("agent"));
+	set(run, "task", flag("task"));
+	set(run, "skill", flag("skill"));
+	set(run, "maxDuration", flag("max-duration"));
+	set(notify, "sink", flag("notify"));
+	set(notify, "when", flag("when"));
+	return {
+		...current,
+		on,
+		run,
+		...(Object.keys(notify).length > 0 ? { notify } : {}),
+	};
 }
 
 interface ConfigChange {
