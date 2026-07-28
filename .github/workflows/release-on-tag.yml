@@ -1,0 +1,118 @@
+name: Publish to npm
+
+# Releasing is `npm version <patch|minor|major> && git push --follow-tags`.
+# Everything below is verification: the tag, the package version and the
+# repository metadata all have to agree before anything is published, because
+# npm provenance signs a claim about which repository built the tarball.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.6)"
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The contract suite is deliberately excluded: it spawns a real Pi, which
+      # is not installed here, and the RPC protocol it pins carries no semver
+      # promise. Run it locally before trusting a new Pi release.
+      - name: Verify the tree is releasable
+        run: npm run check
+
+      - name: Build
+        run: npm run build
+
+      - name: Upgrade npm for OIDC support
+        run: |
+          npm install -g npm@latest
+          npm_version=$(npm --version)
+          echo "npm version: $npm_version"
+          node -e "const v='$npm_version'.split('.').map(Number); if (v[0] < 11 || (v[0] === 11 && v[1] < 5) || (v[0] === 11 && v[1] === 5 && v[2] < 1)) { throw new Error('npm >= 11.5.1 is required for trusted publishing'); }"
+
+      - name: Verify OIDC token availability
+        run: |
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL}" ] && [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" ]; then
+            echo "OIDC token available"
+          else
+            echo "OIDC token NOT available"
+            echo "Check workflow permissions include 'id-token: write'"
+            exit 1
+          fi
+
+      - name: Verify version matches tag
+        run: |
+          tag_version="${RELEASE_TAG#v}"
+          pkg_version=$(node -e "console.log(require('./package.json').version)")
+          echo "Tag version:     $tag_version"
+          echo "Package version: $pkg_version"
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo "Version mismatch! Tag says $tag_version but package.json says $pkg_version"
+            exit 1
+          fi
+
+      - name: Verify trusted publisher repository metadata
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          pkg_repo=$(node -e "const repo=require('./package.json').repository?.url || ''; console.log(repo.replace(/^git\\+/, '').replace(/\\.git$/, '').replace(/^https:\\/\\/github\\.com\\//, ''))")
+          echo "GitHub repository: $GITHUB_REPOSITORY"
+          echo "package.json repo:  $pkg_repo"
+          if [ "$pkg_repo" != "$GITHUB_REPOSITORY" ]; then
+            echo "package.json repository.url must match GitHub repository for npm provenance"
+            exit 1
+          fi
+
+      - name: Publish to npm
+        run: npm publish --access public --tag latest --provenance
+
+      - name: Create release tarball
+        run: |
+          npm pack
+          mkdir -p extract-tmp
+          tar -xzf pi-reactor-*.tgz -C extract-tmp
+          mv extract-tmp/package pi-reactor
+          tar -czf pi-reactor.tar.gz pi-reactor
+          rm -rf extract-tmp pi-reactor pi-reactor-*.tgz
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          generate_release_notes: true
+          files: pi-reactor.tar.gz
+
+      - name: Publish summary
+        if: success()
+        run: |
+          PKG_VERSION=$(node -e "console.log(require('./package.json').version)")
+          echo "Published: pi-reactor@$PKG_VERSION"
+          echo "https://www.npmjs.com/package/pi-reactor"
