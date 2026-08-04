@@ -99,4 +99,18 @@ export const MIGRATIONS: readonly string[] = [
 	  updated_at TEXT NOT NULL
 	);
 	`,
+
+	// v2 -- pi's session id, the one handle that survives leaving this machine
+	`
+	-- Captured from the get_state handshake, which is the earliest this exists
+	-- anywhere outside pi. Notifications and \`resume\` address sessions by it
+	-- because the alternatives do not travel: a run id is a per-daemon
+	-- autoincrement, and session_file is an absolute path on one host.
+	--
+	-- Deliberately unindexed. The only lookup is a prefix comparison, which no
+	-- index on this column can serve anyway, and runs is small (bounded by
+	-- retention) and read once per interactive resume. An index here would be a
+	-- net loss: paid on every claim and settle, both hot, to speed up nothing.
+	ALTER TABLE runs ADD COLUMN session_id TEXT;
+	`,
 ];

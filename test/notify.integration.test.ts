@@ -197,10 +197,10 @@ test("a job killed mid-run STILL notifies, using the cached event-stream text", 
 	}
 });
 
-test("the notification carries a run id, and that id leads back to the transcript", async () => {
-	// Closing the loop. A notification you cannot act on only got you halfway:
-	// "this is interesting, let me ask a follow-up" used to mean finding the run
-	// by its timestamp and then reading a path out of the database by hand.
+test("the notification carries the session id, and it leads back to the transcript", async () => {
+	// Closing the loop. The hint is addressed by pi's session id — the one
+	// identifier that means the same thing on every machine — not the run id,
+	// which is a per-daemon integer nobody but this database can resolve.
 	const f = fixture({ STUB_WORK_MS: "20", STUB_TEXT: "3 deploys, all green" });
 	const tg = await stubTelegram();
 	try {
@@ -222,17 +222,16 @@ test("the notification carries a run id, and that id leads back to the transcrip
 			await waitFor(() => tg.sent.length > 0);
 
 			const text = tg.sent[0]?.text ?? "";
-			const match = /pi-reactor resume (\d+)/.exec(text);
+			const match = /pi-reactor resume (\S+)/.exec(text);
 			assert.ok(match, `the message must say how to continue; got:\n${text}`);
+			assert.equal(match[1], "stub-session", "the hint carries pi's session id, not the run number");
 
-			// And the id in the message actually resolves to a transcript.
-			const runId = Number(match[1]);
-			const session = (await call(f.paths, "run.session", { run: runId })) as {
-				runId: number; sessionFile: string | null; cwd: string | null;
+			// And the id in the message is the one the run recorded — `runs` is what
+			// the operator reads to find it again.
+			const { runs } = (await call(f.paths, "runs", {})) as {
+				runs: Array<{ id: number; sessionId: string | null }>;
 			};
-			assert.equal(session.runId, runId);
-			assert.equal(session.sessionFile, "/tmp/stub-session.jsonl",
-				"the path the notification points at is the one the run recorded");
+			assert.equal(runs[0]?.sessionId, "stub-session");
 		} finally {
 			await daemon.stop();
 		}
@@ -271,11 +270,13 @@ test("a run with no transcript says so instead of pointing nowhere", async () =>
 			// assert on the mechanism rather than on this stub's particulars: the
 			// hint appears exactly when there is something to resume.
 			const text = tg.sent[0]?.text ?? "";
-			const session = (await call(f.paths, "run.session", { run: 1 })) as { sessionFile: string | null };
+			const { runs } = (await call(f.paths, "runs", {})) as {
+				runs: Array<{ sessionId: string | null }>;
+			};
 			assert.equal(
 				/pi-reactor resume/.test(text),
-				session.sessionFile !== null,
-				"the offer to continue must track whether a transcript exists",
+				runs[0]?.sessionId != null,
+				"the offer to continue must track whether there is a session to resume",
 			);
 		} finally {
 			await daemon.stop();

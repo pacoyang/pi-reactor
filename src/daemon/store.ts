@@ -59,6 +59,15 @@ export interface JobRow {
 	 * issue, in which repository. A cron fire has none and this stays "{}".
 	 */
 	event_data: string;
+	/**
+	 * The run row opened for this attempt, in the claim transaction itself.
+	 *
+	 * The row used to be inserted only at settle time, which meant a daemon
+	 * SIGKILLed mid-run left no record of the session it had opened — the one
+	 * transcript the operator most wants to resume. Opening the row at claim and
+	 * filling it in as facts arrive (recordRunStart) closes that hole.
+	 */
+	runId: number;
 }
 
 /**
@@ -161,27 +170,55 @@ export function claimNextJob(db: Db, concurrency: number): JobRow | null {
 
 		if (!row) return null;
 
-		db.prepare("UPDATE jobs SET state = 'running', started_at = ? WHERE id = ?").run(nowIso(), row.id);
-		return row;
+		const ts = nowIso();
+		db.prepare("UPDATE jobs SET state = 'running', started_at = ? WHERE id = ?").run(ts, row.id);
+		// One run row per attempt, open (outcome NULL) until settled. Same
+		// transaction as the state flip: `state='running'` and "exactly one open
+		// run row" are a single invariant, not two.
+		const runInfo = db
+			.prepare("INSERT INTO runs (job_id, agent, started_at) VALUES (?, ?, ?)")
+			.run(row.id, row.agent, ts);
+		return { ...row, runId: Number(runInfo.lastInsertRowid) };
 	});
+}
+
+/**
+ * Fills in what a running job has revealed so far — the pid right after spawn,
+ * the session file and id the moment the get_state handshake answers.
+ *
+ * Its whole purpose is crash-proofing: once the session file is in the row, a
+ * daemon SIGKILLed mid-run still leaves a resumable record. COALESCE keeps the
+ * earliest capture authoritative when settle later writes the same columns.
+ */
+export function recordRunStart(
+	db: Db,
+	runId: number,
+	fields: { pid?: number | undefined; sessionFile?: string | undefined; sessionId?: string | undefined },
+): void {
+	db.prepare(
+		`UPDATE runs SET pid          = COALESCE(pid, ?),
+		                 session_file = COALESCE(session_file, ?),
+		                 session_id   = COALESCE(session_id, ?)
+		 WHERE id = ? AND outcome IS NULL`,
+	).run(fields.pid ?? null, fields.sessionFile ?? null, fields.sessionId ?? null, runId);
 }
 
 export interface FinishInput {
 	jobId: number;
-	agent: string;
+	/** The run row opened at claim time; this transaction closes it. */
+	runId: number;
 	outcome: "succeeded" | "failed" | "interrupted";
 	reason?: string | undefined;
 	errorSummary?: string | undefined;
 	pid?: number | undefined;
 	sessionFile?: string | undefined;
+	sessionId?: string | undefined;
 	usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number } | undefined;
-	startedAt: string;
 	/**
 	 * Present when the notify policy fires.
 	 *
-	 * The body may be a function of the run id, because a notification that wants
-	 * to say "continue this conversation with run 42" cannot know 42 until the run
-	 * row exists — and that row is inserted in this very transaction.
+	 * The body may be a function of the run id, kept for callers that want the id
+	 * in the message even though the resume hint now carries the session id.
 	 */
 	notify?: { sink: string; body: string | ((runId: number) => string) } | undefined;
 	/** When set, the job returns to pending at this time instead of reaching a terminal state. */
@@ -228,30 +265,33 @@ export function finishJob(db: Db, input: FinishInput): FinishResult {
 
 		if (Number(changes) === 0) return { runId: null, outboxId: null, alreadySettled: true };
 
-		const runInfo = db
-			.prepare(
-				`INSERT INTO runs (job_id, agent, pid, session_file, outcome, reason, error_summary,
-				                   input_tokens, output_tokens, cache_read, cache_write, total_tokens,
-				                   started_at, finished_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			)
-			.run(
-				input.jobId,
-				input.agent,
-				input.pid ?? null,
-				input.sessionFile ?? null,
-				input.outcome,
-				input.reason ?? null,
-				input.errorSummary ?? null,
-				input.usage?.input ?? null,
-				input.usage?.output ?? null,
-				input.usage?.cacheRead ?? null,
-				input.usage?.cacheWrite ?? null,
-				input.usage?.total ?? null,
-				input.startedAt,
-				nowIso(),
-			);
-		const runId = Number(runInfo.lastInsertRowid);
+		// Close the run row the claim opened. COALESCE on pid/session columns: the
+		// mid-run recordRunStart capture is the authoritative early write, and the
+		// values handed in here are the same facts observed later.
+		db.prepare(
+			`UPDATE runs SET pid          = COALESCE(pid, ?),
+			                 session_file = COALESCE(session_file, ?),
+			                 session_id   = COALESCE(session_id, ?),
+			                 outcome = ?, reason = ?, error_summary = ?,
+			                 input_tokens = ?, output_tokens = ?, cache_read = ?,
+			                 cache_write = ?, total_tokens = ?, finished_at = ?
+			 WHERE id = ? AND outcome IS NULL`,
+		).run(
+			input.pid ?? null,
+			input.sessionFile ?? null,
+			input.sessionId ?? null,
+			input.outcome,
+			input.reason ?? null,
+			input.errorSummary ?? null,
+			input.usage?.input ?? null,
+			input.usage?.output ?? null,
+			input.usage?.cacheRead ?? null,
+			input.usage?.cacheWrite ?? null,
+			input.usage?.total ?? null,
+			nowIso(),
+			input.runId,
+		);
+		const runId = input.runId;
 
 		let outboxId: number | null = null;
 		if (input.notify) {
@@ -310,21 +350,49 @@ export function markInterrupted(db: Db): InterruptedResult {
 		let notified = 0;
 		for (const row of rows) {
 			db.prepare("UPDATE jobs SET state = 'interrupted', finished_at = ? WHERE id = ?").run(ts, row.id);
-			const runInfo = db
+
+			// Close the run row the claim opened — it may already hold the session
+			// file the handshake captured, which is exactly what makes an interrupted
+			// run resumable. The INSERT fallback covers a database whose running jobs
+			// predate the claim-opens-the-row change.
+			const open = db
 				.prepare(
-					`INSERT INTO runs (job_id, agent, outcome, error_summary, started_at, finished_at)
-					 VALUES (?, ?, 'interrupted', ?, ?, ?)`,
+					`SELECT id, session_id FROM runs
+					 WHERE job_id = ? AND outcome IS NULL ORDER BY id DESC LIMIT 1`,
 				)
-				.run(row.id, row.agent, INTERRUPTED_SUMMARY, row.started_at ?? ts, ts);
+				.get(row.id) as { id: number; session_id: string | null } | undefined;
+			let runId: number;
+			let sessionId: string | null = null;
+			if (open) {
+				db.prepare(
+					"UPDATE runs SET outcome = 'interrupted', error_summary = ?, finished_at = ? WHERE id = ?",
+				).run(INTERRUPTED_SUMMARY, ts, open.id);
+				runId = open.id;
+				sessionId = open.session_id;
+			} else {
+				const runInfo = db
+					.prepare(
+						`INSERT INTO runs (job_id, agent, outcome, error_summary, started_at, finished_at)
+						 VALUES (?, ?, 'interrupted', ?, ?, ?)`,
+					)
+					.run(row.id, row.agent, INTERRUPTED_SUMMARY, row.started_at ?? ts, ts);
+				runId = Number(runInfo.lastInsertRowid);
+			}
 
 			// "success" is the one policy that stays silent: an interrupted run is
 			// not a success. "failure" and "always" both want to hear about it.
 			if (row.notify_sink && row.notify_when !== "success") {
 				const label = row.trigger_id ?? `job ${row.id}`;
+				// This message is the one that most needs the offer to continue: the
+				// harness died mid-conversation, so the transcript is both the record
+				// of what happened and the way to pick it up. The handshake capture
+				// put the id in the row before the daemon went down — omitting it
+				// here would save the data and then hide it.
+				const hint = sessionId ? `\n\n↩ pi-reactor resume ${sessionId}` : "";
 				db.prepare("INSERT INTO outbox (run_id, sink, body, created_at) VALUES (?, ?, ?, ?)").run(
-					Number(runInfo.lastInsertRowid),
+					runId,
 					row.notify_sink,
-					`⚠️ ${label} · ${row.agent} · interrupted\n\n${INTERRUPTED_SUMMARY}`,
+					`⚠️ ${label} · ${row.agent} · interrupted\n\n${INTERRUPTED_SUMMARY}${hint}`,
 					ts,
 				);
 				notified++;
@@ -362,35 +430,44 @@ export function readJobRouting(db: Db, jobId: number): JobRouting | undefined {
 		.get(jobId) as JobRouting | undefined;
 }
 
-export interface RunSession {
-	runId: number;
+// A type alias, not an interface: only the former gets the implicit index
+// signature node:sqlite's Record<string, SQLOutputValue> row type needs.
+export type LocatedSession = {
+	sessionId: string;
+	/** Absolute path, exactly as pi reported it at the handshake. */
+	sessionFile: string;
+	/** Both only for telling candidates apart when a prefix is ambiguous. */
 	agent: string;
-	outcome: string | null;
 	startedAt: string;
-	/** pi's session JSONL. Null when the run died before pi got that far. */
-	sessionFile: string | null;
-}
+};
 
 /**
- * Where a run's transcript lives, so the operator can pick the conversation back
- * up in their own pi (`pi --session <file>`).
+ * Sessions this daemon recorded, by id or unique prefix.
  *
- * The path is recorded but was previously unreachable: `runs` does not return it
- * and nothing else exposed it, so "I got the notification and want to ask a
- * follow-up" ended at opening the database by hand.
+ * Exists because the filesystem is not always the index. `resume` resolves by
+ * globbing pi's default session directory, which is right for the common case
+ * and needs no daemon — but pi also honours `sessionDir` from its settings
+ * (main.js:450-453), and those settings are cwd-bound, so a project-local one
+ * puts an agent's transcripts somewhere no fixed glob can find. Rather than
+ * replicate pi's resolution chain (and inherit its drift), fall back to the
+ * path pi itself reported when the run started.
+ *
+ * Ordered newest first so an ambiguous prefix lists the likely one first.
  */
-export function runSession(db: Db, runId: number): RunSession | undefined {
-	const row = db
-		.prepare("SELECT id, agent, outcome, started_at, session_file FROM runs WHERE id = ?")
-		.get(runId) as { id: number; agent: string; outcome: string | null; started_at: string; session_file: string | null } | undefined;
-	if (!row) return undefined;
-	return {
-		runId: row.id,
-		agent: row.agent,
-		outcome: row.outcome,
-		startedAt: row.started_at,
-		sessionFile: row.session_file,
-	};
+export function locateSessions(db: Db, ref: string, limit = 10): LocatedSession[] {
+	// substr, not LIKE: SQLite's LIKE folds ASCII case by default, which would
+	// make this lookup more permissive than the CLI's own `startsWith` and than
+	// pi's (main.js:124). A plain binary compare keeps all three saying the same
+	// thing, and needs no wildcard escaping. NULL session_id drops out for free.
+	return db
+		.prepare(
+			`SELECT session_id AS sessionId, session_file AS sessionFile, agent,
+			        started_at AS startedAt
+			 FROM runs
+			 WHERE session_file IS NOT NULL AND substr(session_id, 1, ?) = ?
+			 ORDER BY id DESC LIMIT ?`,
+		)
+		.all(ref.length, ref, limit) as LocatedSession[];
 }
 
 /** The job a run belongs to; null for a run whose job has aged out. */
@@ -463,6 +540,7 @@ export function recentRuns(db: Db, limit = 20, deadOnly = false): unknown[] {
 	return db
 		.prepare(
 			`SELECT r.id, r.job_id AS jobId, r.agent, r.outcome, r.reason,
+			        r.session_id AS sessionId,
 			        r.total_tokens AS totalTokens, r.started_at AS startedAt,
 			        r.finished_at AS finishedAt, r.error_summary AS errorSummary
 			 FROM runs r ${where}

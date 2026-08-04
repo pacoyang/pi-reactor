@@ -66,6 +66,8 @@ export interface RunResult {
 	timedOut: boolean;
 	/** pi's session JSONL path. The reaper deletes only sessions listed here. */
 	sessionFile?: string | undefined;
+	/** pi's session UUIDv7, from the same get_state reply as sessionFile. */
+	sessionId?: string | undefined;
 	pid?: number | undefined;
 	durationMs: number;
 }
@@ -93,6 +95,17 @@ export interface RunAgentOptions {
 	 * real session history, and cleaning up after a test is the test's job.
 	 */
 	sessionDir?: string;
+	/**
+	 * Fired right after spawn, before the handshake. Bookkeeping only — a throw
+	 * here must never take the run down, so callers are invoked inside try/catch.
+	 */
+	onSpawn?: (pid: number) => void;
+	/**
+	 * Fired the instant get_state answers — the earliest the transcript's path and
+	 * id exist anywhere outside pi. Persisting them here is what makes a run whose
+	 * daemon is later SIGKILLed still resumable.
+	 */
+	onSession?: (info: { sessionFile: string; sessionId?: string | undefined }) => void;
 }
 
 const DEFAULTS = { startupProbeMs: 30_000, abortGraceMs: 30_000, termGraceMs: 10_000 };
@@ -130,12 +143,21 @@ export async function runAgent(options: RunAgentOptions): Promise<RunResult> {
 		stdio: ["pipe", "pipe", "pipe"],
 	});
 
+	if (typeof child.pid === "number") {
+		try {
+			options.onSpawn?.(child.pid);
+		} catch {
+			// Bookkeeping must never take a run down.
+		}
+	}
+
 	// ---------------------------------------------------------------- state
 	let settled = false;
 	let lastText: string | null = null;
 	let stopReason: string | undefined;
 	let errorMessage: string | undefined;
 	let sessionFile: string | undefined;
+	let sessionId: string | undefined;
 	let stderrTail = "";
 	const usage: UsageTotals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
 
@@ -317,7 +339,16 @@ export async function runAgent(options: RunAgentOptions): Promise<RunResult> {
 
 	const file = probe.frame.data?.sessionFile;
 	if (typeof file === "string") sessionFile = file;
-	log.debug("agent_started", { pid: child.pid, sessionFile });
+	const id = probe.frame.data?.sessionId;
+	if (typeof id === "string" && id !== "") sessionId = id;
+	if (sessionFile) {
+		try {
+			options.onSession?.({ sessionFile, sessionId });
+		} catch {
+			// Bookkeeping must never take a run down.
+		}
+	}
+	log.debug("agent_started", { pid: child.pid, sessionFile, sessionId });
 
 	// ------------------------------------------------- prompt, then await settled
 	const settledPromise = new Promise<void>((resolve) => {
@@ -417,6 +448,7 @@ export async function runAgent(options: RunAgentOptions): Promise<RunResult> {
 			signal: end.signal,
 			timedOut: wasTimedOut,
 			sessionFile,
+			sessionId,
 			pid: child.pid,
 			durationMs: Date.now() - startedAt,
 		};

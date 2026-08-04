@@ -6,9 +6,11 @@
  * the unix socket. That split is what lets the same methods back both the CLI and
  * the pi extension without either drifting.
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 import { resolvePaths, type Paths } from "./core/paths.ts";
-import { callDaemon } from "./core/rpc-client.ts";
+import { callDaemon, DaemonUnavailableError } from "./core/rpc-client.ts";
 import type { StatusResult } from "./core/rpc-types.ts";
 import { formatDuration, parseDuration } from "./core/duration.ts";
 
@@ -21,11 +23,15 @@ const USAGE = `pi-reactor — self-hosted agent event loop
                                any serve option given is written onto the unit
   emit --agent <name> [...]    Enqueue a job
   status                       Queue, spend and agent overview
-  runs [--dead] [--limit N]    Recent run history
-  resume <run-id> [--print]    Continue that run's conversation in your own pi
+  runs [--dead] [--limit N]    Recent run history (with session ids)
+  resume <session-id> [--print]
+                               Continue that session in your own pi. Takes the
+                               id (or unique prefix) a notification carries;
+                               resolves from the local session files, no daemon
+                               needed
   rerun <run-id>               Queue the same work again as a new job
   notify --sink <s> <body>     Queue an outbound message
-  pause | resume               Durable queue switch
+  pause | resume               Durable queue switch (resume with no argument)
   reload                       Re-read config from disk
   doctor                       Preflight: versions, paths, credentials, config
   schedule ls                  Cron watermarks and breaker state
@@ -110,6 +116,167 @@ async function readStdin(): Promise<string> {
 	const chunks: Buffer[] = [];
 	for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
 	return Buffer.concat(chunks).toString("utf8");
+}
+
+// ---------------------------------------------------------------- sessions
+//
+// `resume` addresses sessions by pi's own id (a UUIDv7), the one identifier
+// that means the same thing on every machine. Resolution is a directory glob,
+// not a daemon call: pi names every transcript `<timestamp>_<uuid>.jsonl`, so
+// the filesystem already is the index — which is what lets resume work with no
+// daemon running at all.
+
+interface SessionMatch {
+	file: string;
+	sessionId: string;
+	/** Only for telling candidates apart when a prefix is ambiguous. */
+	when: string;
+	agent?: string;
+}
+
+/** Same root pi uses: $PI_CODING_AGENT_DIR or ~/.pi/agent, plus /sessions. */
+function piSessionsDir(env: NodeJS.ProcessEnv = process.env): string {
+	const agentDir = env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".pi", "agent");
+	return join(agentDir, "sessions");
+}
+
+/**
+ * The id half of `<timestamp>_<id>.jsonl`.
+ *
+ * The character class is pi's own (assertValidSessionId): usually a UUIDv7, but
+ * `pi --session-id my-feature` is legal too, and a resume that could not see
+ * named sessions would be quietly half a feature.
+ */
+const SESSION_FILE_RE = /_([A-Za-z0-9][A-Za-z0-9._-]*)\.jsonl$/;
+
+/**
+ * Every local session whose id starts with `ref`.
+ *
+ * A plain, case-sensitive `startsWith` — the same rule pi applies to
+ * `--session <partial>` (main.js:124). An earlier version folded case and
+ * ignored hyphens; that made the CLI more permissive than both pi and the
+ * daemon's own lookup, and it let `my-feature` and `myfeature` collide.
+ * Newest first, so an ambiguous prefix lists the likely one first.
+ */
+function findLocalSessions(ref: string, dir: string): SessionMatch[] {
+	const found: Array<SessionMatch & { mtimeMs: number }> = [];
+	let projects: string[];
+	try {
+		projects = readdirSync(dir);
+	} catch {
+		return [];
+	}
+	for (const project of projects) {
+		const projectDir = join(dir, project);
+		let files: string[];
+		try {
+			files = readdirSync(projectDir);
+		} catch {
+			continue; // a plain file, or vanished mid-walk
+		}
+		for (const file of files) {
+			const match = SESSION_FILE_RE.exec(file);
+			if (!match) continue;
+			const sessionId = match[1] as string;
+			if (!sessionId.startsWith(ref)) continue;
+			const path = join(projectDir, file);
+			let mtimeMs: number;
+			try {
+				mtimeMs = statSync(path).mtimeMs;
+			} catch {
+				continue;
+			}
+			found.push({ file: path, sessionId, when: new Date(mtimeMs).toISOString(), mtimeMs });
+		}
+	}
+	return found.sort((a, b) => b.mtimeMs - a.mtimeMs).map(({ mtimeMs: _drop, ...m }) => m);
+}
+
+/** Sessions this daemon recorded; `reachable: false` when there is no daemon. */
+async function daemonSessions(paths: Paths, ref: string): Promise<{ reachable: boolean; matches: SessionMatch[] }> {
+	interface Located { sessionId: string; sessionFile: string; agent: string; startedAt: string }
+	try {
+		const { sessions } = (await rpcCall(paths, "session.locate", { session: ref })) as { sessions: Located[] };
+		return {
+			reachable: true,
+			matches: sessions.map((s) => ({
+				file: s.sessionFile, sessionId: s.sessionId, when: s.startedAt, agent: s.agent,
+			})),
+		};
+	} catch (err) {
+		if (err instanceof DaemonUnavailableError) return { reachable: false, matches: [] };
+		throw err;
+	}
+}
+
+/**
+ * The session `ref` names, from the default directory and the daemon's records.
+ *
+ * Two sources because neither alone is complete: the glob sees every session on
+ * this machine's default path but nothing written to a custom `sessionDir`
+ * (which pi resolves per-cwd, so it varies by agent); the daemon knows the exact
+ * path pi reported for every job it ran but nothing about interactive work.
+ *
+ * An exact id short-circuits before the daemon is consulted at all — ids are
+ * unique, so there is nothing a second source could add, and that is the path a
+ * pasted notification takes. A partial prefix cannot be judged unique from one
+ * source, so it merges both before deciding.
+ */
+async function resolveSession(paths: Paths, ref: string, dir: string): Promise<SessionMatch> {
+	const local = findLocalSessions(ref, dir);
+
+	// pi's own rule (main.js:124): an exact id beats anything it is merely the
+	// prefix of, so `my-feature` opens itself and not `my-feature-2`.
+	const exactLocal = local.find((m) => m.sessionId === ref);
+	if (exactLocal) return exactLocal;
+
+	const remote = await daemonSessions(paths, ref);
+	const candidates = [...local];
+	for (const m of remote.matches) {
+		if (!candidates.some((c) => c.sessionId === m.sessionId)) candidates.push(m);
+	}
+
+	const chosen = candidates.find((c) => c.sessionId === ref) ?? (candidates.length === 1 ? candidates[0] : undefined);
+	if (!chosen) {
+		if (candidates.length > 1) {
+			const lines = candidates
+				.slice(0, 10)
+				.map((c) => `  ${c.sessionId}  ${c.agent ?? ""}  ${c.when}`.replace(/\s+$/, ""))
+				.join("\n");
+			fail(`"${ref}" matches ${candidates.length} sessions — add more characters:\n${lines}`);
+		}
+		fail(
+			remote.reachable
+				? `no session matching "${ref}" — not under ${dir}, and this daemon has no record of it.\n` +
+						`Sessions age out with the rest of the history (default 30 days); see \`pi-reactor runs\`.`
+				: `no session matching "${ref}" under ${dir}, and the daemon is not running to check elsewhere.\n` +
+						`If pi is configured with a custom sessionDir, start the daemon or pass the file to pi directly.`,
+		);
+	}
+
+	// Only a daemon record can point at a file that is gone; saying so beats
+	// letting pi report a missing file the operator did not choose to delete.
+	if (!existsSync(chosen.file)) {
+		fail(
+			`session ${chosen.sessionId} is recorded but its transcript is gone:\n  ${chosen.file}\n` +
+				`Sessions are reclaimed with the rest of the history (default 30 days).`,
+		);
+	}
+	return chosen;
+}
+
+/**
+ * The cwd a session ran in, from its first line — pi writes
+ * `{"type":"session", …, "cwd":"…"}` as the opening record.
+ */
+function sessionHeaderCwd(file: string): string | undefined {
+	try {
+		const firstLine = readFileSync(file, "utf8").split("\n", 1)[0] ?? "";
+		const header = JSON.parse(firstLine) as { type?: string; cwd?: string };
+		return header.type === "session" && typeof header.cwd === "string" ? header.cwd : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 /**
@@ -470,63 +637,88 @@ async function main(): Promise<void> {
 			if (args.flags.dead === true) params.dead = true;
 			if (typeof args.flags.limit === "string") params.limit = Number(args.flags.limit);
 			const { runs } = (await rpcCall(paths, "runs", params)) as {
-				runs: Array<{ id: number; agent: string; outcome: string | null; reason: string | null; totalTokens: number | null; startedAt: string; errorSummary: string | null }>;
+				runs: Array<{
+					id: number; agent: string; outcome: string | null; reason: string | null;
+					sessionId: string | null; totalTokens: number | null; startedAt: string;
+					finishedAt: string | null; errorSummary: string | null;
+				}>;
 			};
 			if (runs.length === 0) {
 				process.stdout.write("no runs yet\n");
 				return;
 			}
 			for (const r of runs) {
-				const mark = r.outcome === "succeeded" ? "ok  " : r.outcome === "interrupted" ? "intr" : "FAIL";
+				// outcome NULL = the run row the claim opened is still open: in
+				// flight (or the daemon died with it; markInterrupted settles those
+				// at the next boot). Calling it FAIL would be a lie either way.
+				const live = r.outcome === null && r.finishedAt === null;
+				const mark = live ? "live" : r.outcome === "succeeded" ? "ok  " : r.outcome === "interrupted" ? "intr" : "FAIL";
 				const reason = r.reason ? ` ${r.reason}` : "";
 				const tokens = r.totalTokens ? ` ${r.totalTokens}t` : "";
-				process.stdout.write(`${mark} #${r.id} ${r.agent}${reason}${tokens}  ${r.startedAt}\n`);
+				const elapsed = live
+					? `  (running ${formatDuration(Math.max(0, Math.round((Date.now() - new Date(r.startedAt).getTime()) / 1000)))})`
+					: "";
+				// The full session id, deliberately: it is what `resume` takes, and a
+				// machine-generated line is for copying, not reading aloud.
+				const session = r.sessionId ? `  ${r.sessionId}` : "";
+				process.stdout.write(`${mark} #${r.id} ${r.agent}${reason}${tokens}  ${r.startedAt}${elapsed}${session}\n`);
 				if (r.errorSummary) process.stdout.write(`     ${r.errorSummary}\n`);
 			}
 			return;
 		}
 
 		case "resume": {
-			// Closes the loop a notification opens. The message says "run 42";
-			// this hands run 42's transcript to your own interactive pi, in the
-			// directory the job ran in, so the follow-up question lands in the same
-			// context the answer came from.
-			const run = Number(args.positional[0]);
-			if (!Number.isInteger(run)) fail("usage: pi-reactor resume <run-id>   (see `pi-reactor runs`)");
-
-			const session = (await rpcCall(paths, "run.session", { run })) as {
-				runId: number; agent: string; outcome: string | null; startedAt: string;
-				sessionFile: string | null; cwd: string | null; exists: boolean;
-			};
-
-			if (!session.sessionFile) {
-				fail(`run ${run} has no transcript: it died before pi opened a session (outcome: ${session.outcome ?? "?"})`);
-			}
-			if (!session.exists) {
-				// Sessions age out with everything else. Saying so beats letting
-				// pi report a missing file the operator did not choose.
-				fail(
-					`run ${run}'s transcript is gone: ${session.sessionFile}\n` +
-						`Sessions are reclaimed with the rest of the history (default 30 days).`,
-				);
-			}
-
-			if (args.flags.print === true) {
-				process.stdout.write(`${session.sessionFile}\n`);
+			// Two commands share the word, disambiguated by the argument — the
+			// symmetry partner of `pause` takes none, a session takes its id. (The
+			// no-argument form was unreachable for a while: this very case shadowed
+			// the queue switch further down the dispatch.)
+			const ref = args.positional[0];
+			if (ref === undefined) {
+				const { paused } = (await rpcCall(paths, "resume")) as { paused: boolean };
+				process.stdout.write(paused ? "queue paused\n" : "queue resumed\n");
 				return;
 			}
 
+			// Closes the loop a notification opens. The message names a session by
+			// pi's own UUIDv7; the filesystem is the index (see findLocalSessions),
+			// so this needs no daemon — which is exactly what makes an interrupted
+			// run resumable after the daemon died.
+			if (/^\d{1,8}$/.test(ref)) {
+				fail(
+					`sessions are addressed by pi's session id now, not by run number.\n` +
+						`Run \`pi-reactor runs\` and copy the id (looks like 019f9951-a6b5-…).`,
+				);
+			}
+			if (!/^[A-Za-z0-9][A-Za-z0-9._-]{3,}$/.test(ref)) {
+				fail(`"${ref}" is not a session id or prefix (at least 4 characters)`);
+			}
+
+			const dir = piSessionsDir();
+			const session = await resolveSession(paths, ref, dir);
+			if (args.flags.print === true) {
+				process.stdout.write(`${session.file}\n`);
+				return;
+			}
+
+			// The same working tree the session had. Resuming from elsewhere would
+			// give the agent its old conversation over a different set of files.
+			const cwd = sessionHeaderCwd(session.file);
+			const cwdExists = cwd !== undefined && existsSync(cwd);
+			if (cwd && !cwdExists) {
+				// pi itself will prompt to continue in the current directory; say why
+				// rather than letting that prompt look like a malfunction.
+				process.stderr.write(`note: the session's directory ${cwd} no longer exists\n`);
+			}
+
 			const { spawn } = await import("node:child_process");
-			const child = spawn("pi", ["--session", session.sessionFile], {
+			const child = spawn("pi", ["--session", session.file], {
 				stdio: "inherit",
-				// The same working tree the job had. Resuming from elsewhere would give
-				// the agent its old conversation over a different set of files.
-				...(session.cwd ? { cwd: session.cwd } : {}),
+				...(cwdExists ? { cwd } : {}),
 			});
 			child.on("error", (err: NodeJS.ErrnoException) => {
 				fail(
 					err.code === "ENOENT"
-						? `pi is not on PATH. Open it yourself:\n  cd ${session.cwd ?? "."} && pi --session ${session.sessionFile}`
+						? `pi is not on PATH. Open it yourself:\n  cd ${cwd ?? "."} && pi --session ${session.file}`
 						: err.message,
 				);
 			});
@@ -652,9 +844,10 @@ async function main(): Promise<void> {
 			return;
 		}
 
-		case "pause":
-		case "resume": {
-			const { paused } = (await rpcCall(paths, args.command)) as { paused: boolean };
+		case "pause": {
+			// `resume` (the un-pause) lives in the resume case above, keyed on
+			// having no argument.
+			const { paused } = (await rpcCall(paths, "pause")) as { paused: boolean };
 			process.stdout.write(paused ? "queue paused\n" : "queue resumed\n");
 			return;
 		}
