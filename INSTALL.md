@@ -118,13 +118,21 @@ Do not print a token you read, either. Pipe it.
 **If the provider is registered by a pi extension** rather than built in, name that
 extension on the agent. Batch jobs run with `-ne`, so nothing is loaded that was not
 asked for, and the run otherwise fails at startup with `Unknown provider` — at 09:00,
-not at the point you configured it. `-e` takes a path, so pass the extension's entry
-file, which `pi.extensions` in its package.json names:
+not at the point you configured it.
+
+Name it the same way you installed it. For a published extension that is
+`npm:<pkg>`, and pi resolves it wherever it keeps packages:
 
 ```bash
 pi-reactor agent add <name> --cwd <dir> --model <provider>/<model> \
-  --extension ~/.pi/agent/npm/node_modules/<pkg>/src/index.ts    # repeatable
+  --extension npm:<pkg>                                          # repeatable
 ```
+
+A path works too, and is what you want for an extension of your own that is not
+published. Prefer the `npm:` form for the ones that are: a path like
+`~/.pi/agent/npm/node_modules/<pkg>/src/index.ts` pins both where pi stores packages and
+where that package keeps its entry file, and neither is a promise anyone made you. When
+one of them moves, the agent stops starting — at 09:00.
 
 Read the agent back afterwards. `agent ls` is the only place the allowlist is visible,
 and an empty one on a machine whose provider comes from an extension means the first
