@@ -19,7 +19,7 @@ import { runAgent } from "./agent-runner.ts";
 import { buildJobEnv } from "./job-env.ts";
 import { preflight, makeGitDirtyCheck, type PreflightDeps } from "./preflight.ts";
 import { classify, refused, shouldRetry, backoffSeconds, withJitter, type Classification } from "./outcome.ts";
-import { claimNextJob, finishJob, tokensSpentToday, isPaused, type JobRow } from "./store.ts";
+import { claimNextJob, finishJob, recordRunStart, tokensSpentToday, isPaused, type JobRow } from "./store.ts";
 import { formatDuration } from "../core/duration.ts";
 import type { JobTokens } from "./job-tokens.ts";
 import type { Logger } from "./logger.ts";
@@ -108,15 +108,14 @@ export function createWorker(options: WorkerOptions): Worker {
 	}
 
 	async function processJob(job: JobRow): Promise<void> {
-		const startedAt = nowIso();
-		const log = logger.child({ jobId: job.id, agent: job.agent });
+		const log = logger.child({ jobId: job.id, agent: job.agent, runId: job.runId });
 		const config = getConfig();
 		const agent = config.agents[job.agent];
 
 		if (!agent) {
 			// The agent was removed from config while this job sat in the queue.
 			log.warn("job_agent_missing");
-			settle(job, startedAt, refused("config_error"), {
+			settle(job, refused("config_error"), {
 				errorSummary: `agent "${job.agent}" is no longer defined in agents.json`,
 			});
 			return;
@@ -125,7 +124,7 @@ export function createWorker(options: WorkerOptions): Worker {
 		const gateResult = await runGates(job, agent, log);
 		if (!gateResult.ok) {
 			log.warn("job_refused", { reason: gateResult.reason, detail: gateResult.detail });
-			settle(job, startedAt, refused(gateResult.reason), { errorSummary: gateResult.detail });
+			settle(job, refused(gateResult.reason), { errorSummary: gateResult.detail });
 			return;
 		}
 
@@ -146,6 +145,11 @@ export function createWorker(options: WorkerOptions): Worker {
 				env,
 				maxDurationMs: job.max_duration_s * 1000,
 				logger: log,
+				// Persist facts the moment they exist: after this lands, a daemon
+				// SIGKILLed mid-run still leaves a resumable record.
+				onSpawn: (pid) => recordRunStart(db, job.runId, { pid }),
+				onSession: (info) =>
+					recordRunStart(db, job.runId, { sessionFile: info.sessionFile, sessionId: info.sessionId }),
 				...(options.rpcEntryOverride !== undefined ? { rpcEntry: options.rpcEntryOverride } : {}),
 				...(options.abortGraceMs !== undefined ? { abortGraceMs: options.abortGraceMs } : {}),
 				...(options.termGraceMs !== undefined ? { termGraceMs: options.termGraceMs } : {}),
@@ -157,10 +161,11 @@ export function createWorker(options: WorkerOptions): Worker {
 				tokens: result.usage.total,
 				durationMs: result.durationMs,
 			});
-			settle(job, startedAt, classification, {
+			settle(job, classification, {
 				...(result.errorMessage !== undefined ? { errorSummary: result.errorMessage } : {}),
 				...(result.pid !== undefined ? { pid: result.pid } : {}),
 				...(result.sessionFile !== undefined ? { sessionFile: result.sessionFile } : {}),
+				...(result.sessionId !== undefined ? { sessionId: result.sessionId } : {}),
 				usage: result.usage,
 				lastText: result.lastText,
 				durationMs: result.durationMs,
@@ -169,7 +174,7 @@ export function createWorker(options: WorkerOptions): Worker {
 			// runAgent should not throw, but a spawn-layer surprise must still end
 			// the job rather than leave it running forever.
 			log.error("job_crashed", { error: errorSummary(err) });
-			settle(job, startedAt, { outcome: "failed", reason: "crash", retryable: true }, {
+			settle(job, { outcome: "failed", reason: "crash", retryable: true }, {
 				errorSummary: errorSummary(err),
 			});
 		}
@@ -195,12 +200,13 @@ export function createWorker(options: WorkerOptions): Worker {
 		errorSummary?: string;
 		pid?: number;
 		sessionFile?: string;
+		sessionId?: string;
 		usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
 		lastText?: string | null;
 		durationMs?: number;
 	}
 
-	function settle(job: JobRow, startedAt: string, classification: Classification, extras: SettleExtras): void {
+	function settle(job: JobRow, classification: Classification, extras: SettleExtras): void {
 		const retry = shouldRetry(classification, job.retryable === 1, job.attempts);
 		const notify = buildNotification(job, classification, extras, retry);
 
@@ -211,14 +217,14 @@ export function createWorker(options: WorkerOptions): Worker {
 		try {
 			settled = finishJob(db, {
 				jobId: job.id,
-				agent: job.agent,
+				runId: job.runId,
 				outcome: classification.outcome,
 				...(classification.reason !== undefined ? { reason: classification.reason } : {}),
 				...(extras.errorSummary !== undefined ? { errorSummary: extras.errorSummary } : {}),
 				...(extras.pid !== undefined ? { pid: extras.pid } : {}),
 				...(extras.sessionFile !== undefined ? { sessionFile: extras.sessionFile } : {}),
+				...(extras.sessionId !== undefined ? { sessionId: extras.sessionId } : {}),
 				...(extras.usage !== undefined ? { usage: extras.usage } : {}),
-				startedAt,
 				...(notify !== undefined ? { notify } : {}),
 				...(retry
 					? { retryAt: new Date(Date.now() + withJitter(backoffSeconds(job.attempts)) * 1000).toISOString() }
@@ -261,7 +267,7 @@ export function createWorker(options: WorkerOptions): Worker {
 		c: Classification,
 		extras: SettleExtras,
 		retrying: boolean,
-	): { sink: string; body: (runId: number) => string } | undefined {
+	): { sink: string; body: string } | undefined {
 		if (retrying) return undefined;
 		if (!job.notify_sink || !job.notify_when) return undefined;
 		const when = job.notify_when as NotifyWhen;
@@ -277,17 +283,20 @@ export function createWorker(options: WorkerOptions): Worker {
 		/**
 		 * The line that closes the loop: a notification you can act on.
 		 *
-		 * Without it, "this is interesting, let me ask a follow-up" means finding
-		 * the run by its timestamp and then reading a path out of the database by
-		 * hand — the notification only got you halfway. Only added when there IS a
-		 * transcript: a run that died before pi wrote one has nothing to resume.
+		 * Addressed by pi's session id — the one identifier that means the same
+		 * thing on every machine — rather than the run id, which is a per-daemon
+		 * integer nobody but this database can resolve. Both halves are required:
+		 * the id names the session, the file proves there is one to open. A run
+		 * that died before pi opened a session has nothing to resume, and saying
+		 * so by omission beats a hint that dead-ends.
 		 */
-		const resumeHint = (runId: number): string =>
-			extras.sessionFile ? `\n\n↩ pi-reactor resume ${runId}` : "";
+		const resumeHint = extras.sessionFile && extras.sessionId
+			? `\n\n↩ pi-reactor resume ${extras.sessionId}`
+			: "";
 
 		if (succeeded) {
 			const body = extras.lastText?.trim() || "(no output)";
-			return { sink: job.notify_sink, body: (runId) => `✅ ${label} · ${meta}\n\n${body}${resumeHint(runId)}` };
+			return { sink: job.notify_sink, body: `✅ ${label} · ${meta}\n\n${body}${resumeHint}` };
 		}
 
 		// Failure body comes from the cached event-stream text plus the error
@@ -297,7 +306,7 @@ export function createWorker(options: WorkerOptions): Worker {
 		if (extras.lastText?.trim()) parts.push("", `last output: ${extras.lastText.trim()}`);
 		// A failure is where the follow-up matters most — the transcript says what
 		// it was doing when it stopped.
-		return { sink: job.notify_sink, body: (runId) => `${parts.join("\n")}${resumeHint(runId)}` };
+		return { sink: job.notify_sink, body: `${parts.join("\n")}${resumeHint}` };
 	}
 
 	function head(c: Classification): string {

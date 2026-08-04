@@ -44,29 +44,11 @@ import {
 	setFlag,
 	readJobRouting,
 	jobIdForRun,
-	runSession,
+	locateSessions,
 } from "./store.ts";
 import { resumeSchedule } from "./scheduler.ts";
 import type { JobTokens } from "./job-tokens.ts";
 import { errorSummary, type Logger } from "./logger.ts";
-import { existsSync, readFileSync } from "node:fs";
-
-/**
- * The cwd a pi session ran in, read from its first frame.
- *
- * pi writes `{"type":"session", …, "cwd":"…"}` as the opening line, so this
- * costs one small read and never has to trust our own bookkeeping.
- */
-function sessionCwd(sessionFile: string): string | undefined {
-	try {
-		const firstLine = readFileSync(sessionFile, "utf8").split("\n", 1)[0] ?? "";
-		const header = JSON.parse(firstLine) as { type?: string; cwd?: string };
-		return header.type === "session" && typeof header.cwd === "string" ? header.cwd : undefined;
-	} catch {
-		return undefined; // deleted, truncated, or a format we do not recognise
-	}
-}
-
 export interface MethodDeps {
 	db: Db;
 	/** Re-arms schedules after a breaker is cleared. */
@@ -324,35 +306,24 @@ export function buildMethods(deps: MethodDeps): Record<string, MethodHandler> {
 			};
 		},
 
-		/**
-		 * Where a run's transcript lives, so the operator can carry the
-		 * conversation on in their own pi.
-		 *
-		 * Returns the path plus the directory the job ran in — resuming from
-		 * somewhere else would give the agent the same history but a different
-		 * working tree, which is a confusing half-restoration.
-		 */
-		"run.session"(params) {
-			const runId = typeof params.run === "number" ? params.run : undefined;
-			if (runId === undefined) throw new RpcError(RPC_ERRORS.INVALID_PARAMS, "run must be a number");
-
-			const found = runSession(db, runId);
-			if (!found) throw new RpcError(RPC_ERRORS.INVALID_PARAMS, `no run ${runId}`);
-
-			// The session file records the cwd it ran in, and that is more
-			// trustworthy than today's config: the agent may have been repointed,
-			// or removed, since.
-			const cwd = found.sessionFile ? sessionCwd(found.sessionFile) : undefined;
-			return {
-				...found,
-				cwd: cwd ?? getConfig().agents[found.agent]?.cwd ?? null,
-				exists: found.sessionFile !== null && existsSync(found.sessionFile),
-			};
-		},
-
 		runs(params) {
 			const limit = typeof params.limit === "number" ? Math.min(Math.max(1, params.limit), 200) : 20;
 			return { runs: recentRuns(db, limit, params.dead === true) };
+		},
+
+		/**
+		 * Where a session this daemon ran actually lives.
+		 *
+		 * `resume` finds sessions by globbing pi's default directory, which needs
+		 * no daemon at all — but pi's `sessionDir` setting is cwd-bound, so an
+		 * agent with a project-local one writes where no fixed glob will look.
+		 * This is the authoritative answer for those: the path pi reported at the
+		 * handshake, recorded verbatim.
+		 */
+		"session.locate"(params) {
+			// Paths only; whether the file still exists is the caller's own stat to
+			// make — it shares this filesystem, the socket being local by design.
+			return { sessions: locateSessions(db, requireString(params, "session")) };
 		},
 
 		/**

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { openDb, migrate, userVersion, nowIso, isoSecondsAgo, type Db } from "../src/core/db.ts";
 import { MIGRATIONS } from "../src/core/migrations.ts";
 
@@ -25,6 +26,35 @@ test("migrate: creates tables and advances user_version", () => {
 			.filter((n) => !n.startsWith("sqlite_"));
 		assert.deepEqual(tables, ["events", "jobs", "outbox", "runs", "runtime_state", "schedules"]);
 	});
+});
+
+test("migrate v1->v2: existing rows survive, the new column is NULL", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-reactor-test-"));
+	try {
+		// A database as v1 left it: only the first migration applied.
+		const path = join(dir, "state.db");
+		const v1 = new DatabaseSync(path);
+		v1.exec("PRAGMA journal_mode = WAL");
+		v1.exec(MIGRATIONS[0] as string);
+		v1.exec("PRAGMA user_version = 1");
+		v1.prepare("INSERT INTO runs (agent, outcome, started_at) VALUES ('nightly', 'succeeded', ?)").run(nowIso());
+		v1.close();
+
+		const db = openDb(path);
+		try {
+			assert.equal(userVersion(db), MIGRATIONS.length);
+			const row = db.prepare("SELECT agent, outcome, session_id FROM runs").get() as {
+				agent: string; outcome: string; session_id: string | null;
+			};
+			assert.equal(row.agent, "nightly");
+			assert.equal(row.outcome, "succeeded");
+			assert.equal(row.session_id, null, "a run recorded before the column simply has no session to resume");
+		} finally {
+			db.close();
+		}
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 });
 
 test("migrate: idempotent, running twice leaves user_version untouched", () => {

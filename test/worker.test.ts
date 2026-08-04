@@ -16,7 +16,7 @@ import { buildJobEnv } from "../src/daemon/job-env.ts";
 import { createLogger } from "../src/daemon/logger.ts";
 import { classify } from "../src/daemon/outcome.ts";
 import { openDb } from "../src/core/db.ts";
-import { enqueue, claimNextJob, finishJob, markInterrupted, tokensSpentToday, queueCounts } from "../src/daemon/store.ts";
+import { enqueue, claimNextJob, finishJob, locateSessions, markInterrupted, recordRunStart, tokensSpentToday, queueCounts } from "../src/daemon/store.ts";
 import { cliEvent } from "../src/core/cloudevents.ts";
 import type { AgentProfile } from "../src/core/config.ts";
 
@@ -146,8 +146,7 @@ test("whoever settles a job first owns its verdict", () => {
 		assert.deepEqual(interrupted, { jobIds: [job.id], notified: 1 });
 
 		const late = finishJob(db, {
-			jobId: job.id, agent: "a", outcome: "succeeded",
-			startedAt: new Date().toISOString(),
+			jobId: job.id, runId: job.runId, outcome: "succeeded",
 			notify: { sink: "tg", body: "✅ all good" },
 		});
 
@@ -193,9 +192,7 @@ test("the claim gate serialises jobs for the same agent", () => {
 		assert.equal(third, null, "both agents are busy, so nothing else is claimable");
 
 		// Finishing the first frees that agent.
-		finishJob(db, {
-			jobId: first!.id, agent: "report", outcome: "succeeded", startedAt: new Date().toISOString(),
-		});
+		finishJob(db, { jobId: first!.id, runId: first!.runId, outcome: "succeeded" });
 		const fourth = claimNextJob(db, 4);
 		assert.equal(fourth?.agent, "report");
 		db.close();
@@ -232,13 +229,12 @@ test("the terminal transaction writes job, run and outbox together", () => {
 			maxDurationS: 60, requireCleanTree: false, retryable: true,
 			notify: { sink: "tg", when: "always" },
 		});
-		claimNextJob(db, 2);
+		const claimed = claimNextJob(db, 2);
 
 		const { runId, outboxId } = finishJob(db, {
 			jobId: jobId!,
-			agent: "report",
+			runId: claimed!.runId,
 			outcome: "succeeded",
-			startedAt: new Date().toISOString(),
 			usage: { input: 10, output: 20, cacheRead: 0, cacheWrite: 0, total: 30 },
 			notify: { sink: "tg", body: "done" },
 		});
@@ -265,6 +261,100 @@ test("the terminal transaction writes job, run and outbox together", () => {
 	}
 });
 
+test("a session pi wrote outside the default directory is still locatable", () => {
+	// pi honours `sessionDir` from its settings (main.js:450-453), and those
+	// settings are cwd-bound — a project-local one puts an agent's transcripts
+	// where no fixed glob will look. The daemon recorded the path pi itself
+	// reported, so it stays the authoritative answer for those.
+	const root = mkdtempSync(join(tmpdir(), "pi-reactor-locate-"));
+	try {
+		const db = openDb(join(root, "state.db"));
+		enqueue(db, {
+			event: cliEvent("elsewhere"), lane: "batch", agent: "a", task: "t",
+			maxDurationS: 60, requireCleanTree: false, retryable: true,
+		});
+		const job = claimNextJob(db, 2);
+		recordRunStart(db, job!.runId, {
+			sessionFile: "/srv/custom-sessions/--work--/2026-08-04T00-00-00-000Z_019fabcd-1111-7000-8000-000000000000.jsonl",
+			sessionId: "019fabcd-1111-7000-8000-000000000000",
+		});
+
+		const byPrefix = locateSessions(db, "019fabcd");
+		assert.equal(byPrefix.length, 1);
+		assert.match(byPrefix[0]!.sessionFile, /^\/srv\/custom-sessions\//,
+			"the recorded absolute path, not a guess at where pi keeps sessions");
+
+		assert.equal(locateSessions(db, "019fZZZZ").length, 0);
+		// Case-sensitive, matching pi's startsWith and the CLI's own glob. SQLite's
+		// LIKE folds ASCII case by default, so a rewrite that reached for it would
+		// silently make this lookup the odd one out.
+		assert.equal(locateSessions(db, "019FABCD").length, 0, "uppercase is a different prefix");
+		// A run that never opened a session has nothing to locate.
+		assert.equal(locateSessions(db, "").length, 1, "an empty ref matches everything with a file, nothing without");
+		db.close();
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("the claim opens the run row; the handshake capture survives a SIGKILLed daemon", () => {
+	// The hole this pins: the run row used to be inserted only at settle time, so
+	// a daemon killed mid-run left NO record of the session pi had opened — the
+	// one transcript the operator most wants to resume. Now the claim opens the
+	// row and recordRunStart persists the handshake facts as they arrive; a
+	// restart's markInterrupted closes that same row with the session intact.
+	const root = mkdtempSync(join(tmpdir(), "pi-reactor-capture-"));
+	try {
+		const db = openDb(join(root, "state.db"));
+		enqueue(db, {
+			event: cliEvent("early"), lane: "batch", agent: "a", task: "t",
+			maxDurationS: 60, requireCleanTree: false, retryable: true,
+			notify: { sink: "tg", when: "always" },
+		});
+		const job = claimNextJob(db, 2);
+		assert.ok(job);
+
+		const open = db.prepare("SELECT outcome, session_file FROM runs WHERE id = ?").get(job.runId) as {
+			outcome: string | null; session_file: string | null;
+		};
+		assert.equal(open.outcome, null, "open until settled: jobs.state='running' <=> one run row with outcome NULL");
+		assert.equal(open.session_file, null);
+
+		recordRunStart(db, job.runId, { pid: 4242 });
+		recordRunStart(db, job.runId, {
+			sessionFile: "/tmp/s.jsonl",
+			sessionId: "019f9951-a6b5-7204-80f6-cfb098998b0b",
+		});
+
+		// The daemon dies here (nothing else writes); a restart marks interrupted.
+		markInterrupted(db);
+
+		const after = db.prepare(
+			"SELECT outcome, pid, session_file, session_id FROM runs WHERE id = ?",
+		).get(job.runId) as { outcome: string; pid: number; session_file: string; session_id: string };
+		assert.equal(after.outcome, "interrupted");
+		assert.equal(after.pid, 4242);
+		assert.equal(after.session_file, "/tmp/s.jsonl", "the whole point: the transcript pointer survives the crash");
+		assert.equal(after.session_id, "019f9951-a6b5-7204-80f6-cfb098998b0b");
+
+		// Saving the id and then not telling anyone would be half a fix: the
+		// interrupted message is exactly where the offer to continue matters.
+		const body = (db.prepare("SELECT body FROM outbox ORDER BY id DESC LIMIT 1").get() as { body: string } | undefined)?.body;
+		assert.match(
+			body ?? "",
+			/↩ pi-reactor resume 019f9951-a6b5-7204-80f6-cfb098998b0b/,
+			"the interruption notice must carry the session the handshake captured",
+		);
+		assert.equal(
+			(db.prepare("SELECT COUNT(*) AS n FROM runs").get() as { n: number }).n, 1,
+			"exactly one row per attempt — markInterrupted closes the open row, never inserts a second",
+		);
+		db.close();
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test("a retry returns the job to pending with a backoff instead of a terminal state", () => {
 	const root = mkdtempSync(join(tmpdir(), "pi-reactor-retry-"));
 	try {
@@ -273,12 +363,11 @@ test("a retry returns the job to pending with a backoff instead of a terminal st
 			event: cliEvent("retry-me"), lane: "batch", agent: "report", task: "t",
 			maxDurationS: 60, requireCleanTree: false, retryable: true,
 		});
-		claimNextJob(db, 2);
+		const claimed = claimNextJob(db, 2);
 
 		const retryAt = new Date(Date.now() + 60_000).toISOString();
 		finishJob(db, {
-			jobId: jobId!, agent: "report", outcome: "failed", reason: "provider_error",
-			startedAt: new Date().toISOString(), retryAt,
+			jobId: jobId!, runId: claimed!.runId, outcome: "failed", reason: "provider_error", retryAt,
 		});
 
 		const job = db.prepare("SELECT state, attempts, scheduled_at FROM jobs WHERE id = ?").get(jobId!) as {
