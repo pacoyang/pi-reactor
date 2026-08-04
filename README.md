@@ -175,13 +175,19 @@ A notification carries the agent's final answer, the cost, and a way back in:
 
 Three deploys yesterday, all green.
 
-↩ pi-reactor resume 42
+↩ pi-reactor resume 019f9951-a6b5-7204-80f6-cfb098998b0b
 ```
 
-That last line closes the loop. `pi-reactor resume 42` opens run 42's transcript in your
-own interactive Pi, in the directory the job ran in, with its full context — so the
-follow-up question lands where the answer came from. Transcripts age out with the rest of
-the history (30 days by default), and `resume` tells you plainly when one has.
+That last line closes the loop. It opens that transcript in your own interactive Pi, in
+the directory the job ran in, with its full context — so the follow-up question lands
+where the answer came from. Transcripts age out with the rest of the history (30 days by
+default), and `resume` tells you plainly when one has.
+
+The identifier is Pi's own session id, not a run number, because a run number means
+nothing outside the daemon that issued it. Resolution is a lookup in Pi's session
+directory rather than a query to the daemon, which is what lets `resume` work when the
+daemon is the thing that died — a run interrupted by a SIGKILL leaves its transcript
+behind, and its obituary carries the same line. Any unique prefix will do.
 
 Bodies are rendered per sink: Telegram gets its HTML subset, Slack gets mrkdwn. Long
 output is split at paragraph boundaries rather than truncated. A `429` is obeyed by its
@@ -307,11 +313,13 @@ webhook [--port 8787]        Run the public webhook listener
 service [--user|--system]    Print a service definition for this install
 emit --agent <name> [...]    Enqueue a job now
 status                       Queue depth, dead letters, today's spend
-runs [--dead] [--limit N]    Recent run history
-resume <run-id> [--print]    Continue that run's conversation in your own Pi
+runs [--dead] [--limit N]    Recent run history, with session ids
+resume <session-id>          Continue that session in your own Pi; takes the id
+       [--print]             (or any unique prefix) a notification carries
 rerun <run-id>               Queue the same work again as a new job
 notify --sink <s> <body>     Queue an outbound message (agents use this mid-run)
 pause | resume               Durable queue switch; survives a restart
+                             (resume with no argument)
 reload                       Re-read configuration from disk
 doctor                       Preflight, with a fix for every failure
 schedule ls | resume <id>    Cron watermarks and breaker state
