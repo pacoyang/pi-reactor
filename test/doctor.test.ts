@@ -9,7 +9,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { piVersionSupported } from "../src/daemon/doctor.ts";
+import { piVersionSupported, isLocalExtension } from "../src/daemon/doctor.ts";
 
 test("support is asserted for a minor, not for a point", () => {
 	assert.ok(piVersionSupported("0.82.0"));
@@ -25,4 +25,21 @@ test("support is asserted for a minor, not for a point", () => {
 
 test("a version that cannot be read is not quietly treated as supported", () => {
 	for (const v of ["unknown", "", "0.82", "x.y.z"]) assert.equal(piVersionSupported(v), false, JSON.stringify(v));
+});
+
+test("only extensions named by path are ours to check for", () => {
+	// Measured against a live daemon: an agent with `npm:` extensions ran
+	// perfectly while doctor reported both as missing, because the check statted
+	// the spec string. Where pi puts a fetched extension is pi's business, and a
+	// check that is always red is a check nobody reads.
+	for (const spec of ["npm:pi-sub2api", "npm:pi-glean@1.2.3", "github:owner/repo", "git:x", "https://e.example/x.ts", "ssh://g/x"]) {
+		assert.equal(isLocalExtension(spec), false, spec);
+	}
+
+	// Everything else is a path to pi (utils/paths.js:26), including a bare name.
+	for (const spec of ["/root/.pi/agent/npm/node_modules/pi-glean/src/index.ts", "./local.ts", "~/x.ts", "plain-name.ts"]) {
+		assert.equal(isLocalExtension(spec), true, spec);
+	}
+
+	assert.equal(isLocalExtension("  npm:pi-glean  "), false, "pi trims before deciding, so this must too");
 });

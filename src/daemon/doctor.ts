@@ -43,6 +43,26 @@ export interface Check {
 const SUPPORTED_PI_MINOR = "0.82";
 const SUPPORTED_PI_RANGE = `${SUPPORTED_PI_MINOR}.x`;
 
+/**
+ * Prefixes pi treats as something other than a path (`isLocalPath`,
+ * utils/paths.js:26). Everything else is a path, including a bare name.
+ */
+const MANAGED_EXTENSION_PREFIXES = ["npm:", "git:", "github:", "http:", "https:", "ssh:"];
+
+/**
+ * Whether an extension is named by path, and so can be checked by looking.
+ *
+ * `-e npm:pi-sub2api` and its git equivalents name something pi fetches and
+ * stores wherever it likes; statting the string reports every one of them as
+ * missing while the agent runs perfectly. Where they land is pi's business, so
+ * this checks the specs it can and stays quiet about the rest rather than
+ * reaching into another tool's storage layout to guess.
+ */
+export function isLocalExtension(spec: string): boolean {
+	const trimmed = spec.trim();
+	return !MANAGED_EXTENSION_PREFIXES.some((p) => trimmed.startsWith(p));
+}
+
 export function piVersionSupported(version: string): boolean {
 	// The full x.y.z shape is required: "0.82" is not a release, and matching it
 	// would let a truncated or unread version pass as supported.
@@ -138,12 +158,18 @@ export async function runDoctor(paths: Paths): Promise<Check[]> {
 		});
 
 		// A provider registered by an extension needs that extension allowlisted,
-		// because batch runs always pass -ne.
+		// because batch runs always pass -ne. Only the ones named by path can be
+		// checked here; see isLocalExtension.
 		if (agent.extensions.length > 0) {
-			const missing = agent.extensions.filter((e) => !existsSync(e));
+			const byPath = agent.extensions.filter(isLocalExtension);
+			const missing = byPath.filter((e) => !existsSync(e));
+			const managed = agent.extensions.length - byPath.length;
 			checks.push({
 				ok: missing.length === 0,
-				label: `agent "${agent.name}": ${agent.extensions.length} allowlisted extension(s) exist`,
+				label: byPath.length > 0
+					? `agent "${agent.name}": ${byPath.length} extension path(s) exist`
+					: `agent "${agent.name}": ${managed} extension(s) resolved by pi`,
+				...(managed > 0 && byPath.length > 0 ? { note: `${managed} more resolved by pi` } : {}),
 				fix: `missing: ${missing.join(", ")}`,
 			});
 		}
